@@ -736,6 +736,11 @@ class DFlashQwen3Model(nn.Module):
         for name, loaded_weight in weights:
             if "midlayer." in name:
                 name = name.replace("midlayer.", "layers.0.")
+            # DFlash2 checkpoints carry conv + candidate-selector tensors the
+            # V1 drafter does not use (V2-only upgrade); skip them so a
+            # DFlash2 checkpoint drafts as DFlash1 (upstream PR #52816).
+            if ("_conv." in name or "candidate_selector" in name):
+                continue
             if self.quant_config is not None and (
                 scale_name := self.quant_config.get_cache_scale(name)
             ):

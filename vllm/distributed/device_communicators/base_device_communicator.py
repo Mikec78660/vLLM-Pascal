@@ -187,6 +187,12 @@ class DeviceCommunicatorBase:
         return self.all_reduce(input_a + input_b)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        # NOTE: dummy sampler passes input_=None; fall through to the
+        # original gloo path below which handles it via distributed ops.
+        pynccl_ok = (
+            input_ is not None
+            and getattr(input_, "dim", lambda: 0)() > 0
+        )
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -199,6 +205,28 @@ class DeviceCommunicatorBase:
         output_tensor = torch.empty(
             output_size, dtype=input_.dtype, device=input_.device
         )
+        # Pascal bridge: torch built USE_NCCL=0 → dist.all_gather falls back
+        # to gloo (CPU), which burns ~60% CPU per worker per decode step.
+        # Route through our patched pynccl communicator (ncclAllGather,
+        # NCCL 2.22.3) so the gather stays on GPU.
+        # self may be the CudaCommunicator subclass which owns pynccl_comm
+        # directly; getattr keeps other platform communicators safe.
+        pynccl_comm = getattr(self, "pynccl_comm", None)
+        if pynccl_ok and pynccl_comm is not None and not pynccl_comm.disabled:
+            if dim == 0 or input_.dim() == 1:
+                out_reshaped = output_tensor.reshape(self.world_size,
+                                                     *input_size)
+                pynccl_comm.all_gather(out_reshaped, input_, None)
+                return out_reshaped.movedim(0, dim).reshape(
+                    input_size[:dim]
+                    + (self.world_size * input_size[dim],)
+                    + input_size[dim + 1 :])
+            if input_.dim() == 2 and dim == 1:
+                out2 = torch.empty(self.world_size, *input_size,
+                                   dtype=input_.dtype, device=input_.device)
+                pynccl_comm.all_gather(out2, input_, None)
+                return out2.movedim(0, 1).reshape(
+                    input_size[0], self.world_size * input_size[1])
         # All-gather.
         dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
         # Reshape

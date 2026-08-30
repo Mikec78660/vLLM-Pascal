@@ -161,6 +161,55 @@ def triton_w4a16_gemm_kernel(
     tl.store(c_ptrs, c, mask=mask_c)
 
 
+
+# ---------------------------------------------------------------------------
+# Pascal fast-decode path: hand-tuned split-K W4A16 GEMV (CUDA, sm_60/61).
+# Dequantizes each weight ONCE and FMAs into all M rows -> bandwidth-bound
+# (P40: ~200 GB/s vs ~25 GB/s for the Triton GEMM at M<=4).
+# Loaded lazily; any failure silently falls back to the Triton GEMM.
+# partial buffers are cached (stable addresses => CUDA-graph safe).
+# ---------------------------------------------------------------------------
+_W4A16_GEMV = None
+try:
+    import importlib.util as _ilu
+    import os as _os
+
+    _so_path = _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)), "w4a16_gemv.so"
+    )
+    if _os.path.exists(_so_path):
+        _spec = _ilu.spec_from_file_location("w4a16_gemv", _so_path)
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _W4A16_GEMV = _mod.w4a16_gemv
+except Exception:
+    _W4A16_GEMV = None
+
+_GEMV_PARTIALS = {}
+
+
+def _pick_splitk(K, G, M):
+    # M=1 (single-token verify) saturates at S=32; M>=2 (MTP draft batches)
+    # peaks one notch lower. Measured on P40 gate_proj K=5120: M=1 S32 0.231 ms,
+    # M=3 S16 0.356 ms (S32 = 0.413 ms).
+    start = 0 if M <= 1 else 1
+    for S in (32, 16, 8, 4, 2, 1)[start:]:
+        if K % S == 0 and (K // S) % G == 0:
+            return S
+    return 1
+
+
+def _w4a16_gemv_dispatch(a, b_q, scales, qzeros, M, K, N, G):
+    S = _pick_splitk(K, G, M)
+    block = 128 if M <= 1 else 256
+    key = (S, block, N, a.device.index)
+    part = _GEMV_PARTIALS.get(key)
+    if part is None:
+        part = torch.empty(S, 4, N, dtype=torch.float32, device=a.device)
+        _GEMV_PARTIALS[key] = part
+    return _W4A16_GEMV(a, b_q, scales, qzeros, G, S, part, block)
+
+
 def triton_w4a16_gemm(
     a: torch.Tensor,  # [M, K] fp16/bf16
     b_q: torch.Tensor,  # [K, N//8] int32
@@ -202,6 +251,26 @@ def triton_w4a16_gemm(
             f"qzeros shape mismatch: {qzeros.shape}"
         )
 
+    # ---- Fast decode path: CUDA split-K GEMV for small M (Pascal) ----
+    _conds = {
+        "loaded": _W4A16_GEMV is not None,
+        "fp16": a.dtype == torch.float16,
+        "has_zp": qzeros is not None,
+        "smallM": M <= 4,
+        "gs": group_size > 0,
+        "kgd": K % group_size == 0 if group_size > 0 else False,
+        "sctype": scales.dtype in (torch.float16, torch.bfloat16),
+        "zptype": qzeros.dtype == torch.int32 if qzeros is not None else False,
+    }
+    import logging as _lg
+    if all(_conds.values()):
+        _lg.getLogger(__name__).warning_once(
+            "W4PROBE: GEMV FIRED K=%d N=%d M=%d", K, N, M)
+        return _w4a16_gemv_dispatch(a, b_q, scales, qzeros, M, K, N, group_size)
+    _lg.getLogger(__name__).warning_once(
+        "W4PROBE: FALLBACK reasons=%s K=%d N=%d M=%d",
+        str([k for k, v in _conds.items() if not v]), K, N, M)
+
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
 
     has_zp = qzeros is not None
@@ -228,12 +297,17 @@ def triton_w4a16_gemm(
             else:
                 BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 32
     else:
+        # Pascal (SM6.1 P40), measured 2026-08-24: the upstream M>64 pick
+        # (BLOCK_M=128, BLOCK_N=128) collapses to ~37 GF/s on SM 6.x
+        # (reg+shared spill -> 1 block/SM): 3.03ms at M=32 -> 734ms at
+        # M=151 (56x cliff). BM=32 stays ~2000 GF/s at M=151-512.
+        # Keep BM=32 for all M; BN=32 for M>64 (best measured at M=151).
         if M <= 32:
             BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 32
         elif M <= 64:
-            BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+            BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 32
         else:
-            BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 32
+            BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 32
 
     # The kernel loads scales/zeros for a single group per BLOCK_K tile
     # (one g_idx per iteration). If BLOCK_K > group_size, rows at the tail

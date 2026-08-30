@@ -6,8 +6,10 @@ vllm/vllm_flash_attn/*
 !vllm/vllm_flash_attn/__init__.py
 !vllm/vllm_flash_attn/flash_attn_interface.py
 
-# OpenAI triton kernels copied from source
+# OpenAI triton kernels copied from source (vendored on Pascal: tracked)
 vllm/third_party/triton_kernels/*
+!vllm/third_party/triton_kernels/**
+vllm/third_party/triton_kernels/**/__pycache__/
 
 # FlashMLA interface copied from source
 vllm/third_party/flashmla/flash_mla_interface.py
@@ -25,6 +27,9 @@ __pycache__/
 
 # C extensions
 *.so
+# Pascal hand-built GEMV kernels: tracked (loaded via importlib at runtime)
+!vllm/model_executor/kernels/linear/mixed_precision/*.so
+!vllm/model_executor/layers/quantization/*.so
 
 # Rust binaries
 vllm/vllm-rs

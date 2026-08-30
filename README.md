@@ -1,402 +1,413 @@
-# 1Cat-vLLM
+# vLLM-Pascal
 
-> 一猫之下始终相信，V100 不该在今天的大模型浪潮中被轻易宣判“过时”。
+> **Upstream:** [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM.git) — a vLLM
+> engineering fork built for **Tesla V100 / SM70** (TurboMind-derived SM70 kernels,
+> V100 FlashAttention path, long-context runtime defaults, AWQ on Volta).
 >
-> 1Cat-vLLM 是一个专注于 **SM70 / Tesla V100** 的 vLLM 工程分支。我们
-> 不追求覆盖所有硬件，而是围绕 Volta 架构补齐并优化现代大模型推理的
-> 关键路径，包括量化推理、注意力后端、长上下文、MTP 投机解码、
-> CUDA Graph、分布式通信、运行时策略和部署工具链，让 Qwen、DeepSeek
-> 等新模型在 V100 上从“能跑”走向“可部署、可验证、可持续优化”。
->
-> 我们希望把来自真实 V100 环境的工程实现、性能数据和验证过程贡献给
-> 开源社区，也欢迎仍在使用 V100 的个人开发者、工作室和团队参与测试、
-> 复现、反馈和共建，让这批依然有价值的算力继续发挥作用。
+> **This fork** — vLLM-Pascal, a sibling of that project — makes the same class of
+> models run on **Pascal GPUs (CC 6.x): Tesla P40 (6.1) and P100 (6.0)**. Pascal has
+> no tensor cores for FP16/BF16, no FP8, no native INT8 tensor ops, and its Triton
+> codegen path rejects `fp8e4nv` outright. Every kernel in this fork's decode path
+> was measured on real P40/P100 hardware, and the numbers below are what the
+> hardware actually does.
 
-<img width="1173" height="1280" alt="微信图片_202608172313362" src="https://github.com/user-attachments/assets/e5ac0ed1-52c5-483c-ba69-35635fab44e2" />
+vLLM-Pascal is a branch of the 1Cat-vLLM repo. It adds CC 6.0/6.1 to the build
+(`TORCH_CUDA_ARCH_LIST="6.0;6.1"`), skips the SM70-only kernel bundles, and patches
+the kernel/config gaps that otherwise make vLLM unusable or ~5× slow on Pascal.
+All Qwen3.5/3.8 checkpoints tested here are hybrid GDN linear-attention models
+(48 of 64 layers GDN, 16 full attention) — the hardest case for a kernel stack.
 
-1Cat-vLLM is a vLLM engineering fork focused on **SM70 / Tesla V100**.
-Rather than targeting every hardware platform, it fills and optimizes the
-critical inference paths required by modern models on Volta, including
-quantized inference, attention backends, long-context serving, MTP speculative
-decoding, CUDA Graph execution, distributed communication, runtime policies,
-and deployment tooling.
+## What the fork changes (Pascal-relevant patches, newest first)
 
-The goal is to make models such as Qwen and DeepSeek not merely runnable on
-V100, but deployable, reproducible, and continuously optimizable.
+| Patch | What it does | Why |
+|---|---|---|
+| `kv_cache_dtype fp8 → int8_per_token_head` alias  | On CC < 70, `--kv-cache-dtype fp8` is remapped to `int8_per_token_head` | Triton on SM6.x cannot compile `fp8e4nv`; the int8 per-token-head path uses the same 1 byte/token, has better precision (7-bit mantissa), and is fully supported by the TRITON_ATTN backend. Your harness keeps passing `fp8`; the fork quietly does the right thing. |
+| CT W8A8-FP8 load-time dequant fallback  | `compressed-tensors` per-channel FP8 (e.g. RedHatAI `*-FP8-dynamic`) dequants to FP16 at load on CC < 70; decode runs cuBLAS FP16 | Upstream scheme hard-gates `min_capability 89` (cutlass scaled_mm, SM89 kernels). Pascal: materialize weights once, never touch FP8 at runtime. |
+| Triton W4A16 prefill block-cliff fix  | M>64 prefill now uses (32,32,32) blocks on SM6.x | Upstream (128,128,32) picks spill registers on Pascal → ~37 GF/s. A 151-token prompt went from **734 ms → 13 ms** (55×). |
+| W4A16 split-K CUDA GEMV (`w4a16_gemv.cu`) | Custom decode GEMV: each thread owns 8 output columns, dequants each packed int32 nibble **once**, FMAs into all M≤4 accumulator rows; int4 weights stay resident | Pascal has no tensor cores: the stock Triton path re-dequantizes weight tiles per activation row (~10× wasted ALU). 1.69 → 0.24 ms per GEMM at M=1 (213 GB/s, near P40 GDDR5 roofline). |
+| NCCL all_gather via pynccl | Routes TP `all_gather` through `ncclAllGather` (SHM transport on this box) instead of the gloo CPU fallback | The source-built torch has `USE_NCCL=0`; without this, every TP step round-trips GPU→host→gloo→host→GPU. |
+| Qwen3.5 MTP support (`qwen3_5_mtp.py` + spec config wiring) | Native MTP head as speculative draft model; `--speculative-config '{"method":"mtp",...}'` | Upstream rewires `qwen3_5` to `qwen3_5_mtp` only in specific paths; this fork wires the named `mtp` method for Pascal. |
+| DFlash2-as-V1 bridge  | Checkpoint-format bridge so parallel-draft checkpoints load | The *decoding* (non-causal attention) is hard-blocked on Pascal — FlexAttention path dies on hybrid GDN block sizes. Format-only support. |
+| CMake: `CUDA_SUPPORTED_ARCHS "6.0;6.1;..."` (two branches) + `VLLM_SKIP_SM70_BUNDLES=1` | Build for Pascal, don't build SM70-only bundles (FA-V100, flash_qla, tcmalloc) | The upstream V100 branch's bundles are SM70-only and waste the build. |
 
-## Project Focus
+Also in this fork: FP8 blockwise ([128,128]) dequant fallback, Exllama WNA16
+routing for int8 checkpoints, CUDA-graph-safe partial-buffer caching, tool-call
+parser `qwen3_xml` for Qwen3.x instruct models.
 
-- **V100 / SM70 first**: optimized for Tesla V100 rather than being a generic
-  multi-hardware fork.
-- **AWQ on Volta**: AWQ 4-bit inference paths for dense and MoE Qwen models on
-  SM70.
-- **V100 FlashAttention path**: `FLASH_ATTN_V100` decode and prefill backend
-  for Volta GPUs, with SM70 compile-graph, guarded XQA decode, and D=256
-  paged-prefix low-smem fast paths enabled by default.
-- **DeepSeek V4 Flash**: supports running the original, unmodified DeepSeek V4
-  Flash weights across eight GPUs.
-- **Day-0 Qwen3.8-27B support**: native Day-0 support for Qwen3.8-27B.
-- **Quantization support**: FP8, NVFP4, MXFP4, AWQ, and GPTQ inference paths
-  are included for supported model and hardware combinations. Availability
-  and production status vary by checkpoint and runtime route.
-- **Long-context serving**: public profiles default to 256K context where the
-  model and memory budget allow it.
-- **MTP serving**: Qwen3.6-class MTP speculative decoding remains available as
-  an explicit opt-in path; long-context public profiles default to no MTP.
-- **Image inputs by default**: SM70 `FLASH_ATTN_V100` profiles allow one image
-  per prompt by default; video inputs remain opt-in.
-- **Tool calling and OpenAI API compatibility**: validated with OpenAI-style
-  clients such as Cherry Studio, OpenClaw, and similar tools.
-- **Experimental FP8 work**: FP8 model and KV-cache paths are included for
-  validation, but they are not production defaults.
-- **Experimental DFlash work**: included for continued research and validation.
+Provenance note: the same patches also exist on the preserved experimental
+v1.3.0-merged line (tag `legacy/a561ea8a1-preconsolidate`); this branch
+carries them as hand-tuned files, not that commit history.
 
-## Recommended Model Providers
+## Test system
 
-- `tclf90/Qwen3.6-27B-AWQ`
-- `tclf90/Qwen3.6-35B-A3B-AWQ`
-- `tclf90/Qwen3.5-122B-A10B-AWQ` for larger 4-GPU setups
-- `Qwen/Qwen3.8-27B` for the latest supported Qwen release
+All numbers below come from one physical machine (`llama.lan`), a Debian 13 (trixie)
+LXC container on a Proxmox host:
 
-The launch examples use local paths such as `/path/to/Qwen3.6-27B-AWQ`.
-Replace them with your local model path or a Hugging Face repository id.
+| | |
+|---|---|
+| CPU | AMD EPYC 3151 — 4 cores / 8 threads, 1.2–2.7 GHz, 16 MiB L3 |
+| RAM | 24 GiB (LXC cgroup), + 8 GiB swap; 16 GiB tmpfs `/tmp` for venv/caches |
+| GPUs | **5× Tesla P40** (24 GB GDDR5, ~196 GB/s, CC 6.1, idx 0–4) + **2× Tesla P100-PCIE** (16 GB HBM2, ~732 GB/s, CC 6.0, idx 5,6) |
+| PCIe | **Gen1 (2.5 GT/s)**. Slots are x16 but negotiate **x1** in this chassis → ~250 MB/s per GPU. Model loads are PCIe-bound (a 13 GB dequantized 9B takes ~52 s); TP collectives run over shared memory (NCCL SHM transport, P2P enabled between the P40s), and decode is GPU-bandwidth-bound, so the x1 link does **not** limit tok/s — only load time. |
+| GPU topology | All 7 cards share one PCIe switch (PIX), single NUMA node |
+| Driver / runtime | NVIDIA 550.127.05, Python 3.13.5, uv-managed venv. **No CUDA toolkit on the runtime host** — Triton 3.6.0 ships its own `ptxas`, torch is a source-built cu124 wheel. |
 
-## Hardware Target
+## Models tested
 
-The public commands are written for V100 Qwen serving workloads. Image inputs
-are enabled by default on the SM70 `FLASH_ATTN_V100` path; video inputs are
-disabled by default and should be enabled explicitly only after local memory
-validation.
+| Model (checkpoint) | Quant | Size | Notes |
+|---|---|---|---|
+| `Qwen3.5-9B-FP8-dynamic` | compressed-tensors, per-channel FP8 (e4m3) | 14 GB | RedHatAI. On Pascal → FP16-materialized fallback (26 GB resident). No MTP head in this checkpoint. |
+| `Qwen3.5-9B-w4a16` | compressed-tensors WNA16 int4, **symmetric** | 11 GB | RedHatAI. 232 modules stay BF16 (GDN/vision/embeddings); symmetric ⇒ the asymmetric GEMV gate doesn't fire, Exllama kernel serves it. |
+| `Qwen3.8-27B-AWQ-INT4` | AWQ int4, asymmetric | 20 GB | The GEMV showcase: near-total quant coverage, int4-resident weights. |
+| `Qwen3.8-27B-FP8` | blockwise [128,128] FP8 | 29 GB | On Pascal → FP16-materialized. Has native MTP head. |
+| `Qwen3.8-27B-INT8-W8A16-MTP` | compressed-tensors group-128 symmetric int8 | 30 GB | True weight-only W8A16; BF16 kept for vision/lm_head/MTP head. Served by the Exllama WNA16 kernel (no custom kernel needed). |
 
-| Host | Notes |
-| --- | --- |
-| 4 x Tesla V100 32 GB | Main public reference target |
-| 2 x Tesla V100 32 GB | Supported for selected 27B profiles with lower concurrency |
-| 8 x Tesla V100 32 GB | DeepSeek V4 Flash original-checkpoint TP8 target |
+All launches: `--dtype float16`, CUDA graphs (`--compilation-config
+'{"mode":0,"cudagraph_mode":"FULL"}'` — the GDN backend downgrades to
+FULL_DECODE_ONLY, i.e. decode is graphed, prefill eager), `--enable-auto-tool-choice
+--tool-call-parser qwen3_xml`, `NCCL_P2P_DISABLE=0`. KV cache dtype `fp16` unless
+stated. **Never pass `--enforce-eager`** — eager re-dispatches ~128 kernels per
+decode token through Python and burns 4 CPU cores; with graphs worker CPU is ~0%.
 
-Typical model placement:
+## Benchmark method
 
-- `Qwen3.6-27B-AWQ`: TP1/TP2/TP4 supported; TP4 is the public reference.
-- `Qwen3.6-27B-AWQ + MTP`: explicit opt-in profile for local validation, not
-  the long-context public default.
-- `Qwen3.6-35B-A3B-AWQ`: TP4 recommended.
-- `Qwen3.5-122B-A10B-AWQ`: TP4 supported for larger deployments.
-- `DeepSeek-V4-Flash`: the original mixed MXFP4/FP8 checkpoint is supported
-  on eight 32 GB V100 GPUs with TP8.
-- `Qwen3.8-27B`: supported natively from Day 0, with validated FP16 and FP8
-  serving paths.
+- Canonical client: 250-token generation, temp 0, `ignore_eos`, **1 warmup request
+  first** (absorbs first-call Triton JIT + DVFS ramp — P40s idle at P8 state and
+  ramp ~1 s after load; un-warmed numbers can read 30% low), token counts from
+  `usage.completion_tokens` (MTP streams multiple tokens per SSE chunk — chunk
+  counts are wrong).
+- Decode t/s per stream = tokens/wall; aggregate = sum over N parallel streams.
+- Prefill = time-to-first-token over a 2048-token prompt, t/s = prompt_tokens/TTFT.
+- KV pool = the engine's own `GPU KV cache size` log line (trust it; the graph
+  memory-profiling accounting shifts effective budget between boots).
+- **First pass on a fresh Triton cache is a warm-up, not a measurement.** With a
+  cold cache the first requests trigger in-situ kernel JIT (visible as `Triton
+  kernel JIT compilation during inference` warnings inside the bench window) and
+  the numbers come out 1.5–3× low. All measured numbers below are from warm-cache
+  runs; contaminated first-pass values are kept only as a warning, not data.
+- **One server at a time.** Two vLLM servers benchmarking concurrently on this box
+  interfere through the shared CPU (8 threads) and the shared PCIe/SHM path; all
+  tables below are sequential.
 
-Multimodal defaults:
+## Results
 
-- Default SM70 `FLASH_ATTN_V100` serving allows `image=1`, `video=0` when
-  `--limit-mm-per-prompt` is not set.
-- For text-only serving, pass `--limit-mm-per-prompt '{"image":0,"video":0}'`
-  or use `--language-model-only`.
-- For video workloads, pass an explicit limit such as
-  `--limit-mm-per-prompt '{"image":1,"video":1}'` and retune memory settings.
+### Qwen3.5-9B-FP8-dynamic (→ FP16 materialized) — the P40 x2 / x4 matrix
 
-## Validated Stack
+P40s 0,1 (TP=2), ctx 32768, KV fp16, graphs — full sweep, warm cache:
 
-The public wheel path is validated on:
+| conc | decode t/s (agg) | per stream |
+|---|---|---|
+| x1 | 23.35 | 23.35 |
+| x2 | 17.65 | 8.8 |
+| x4 | 32.38 | 8.1 |
+| x8 | 49.14 | 6.1 |
+| x16 | **63.34** | 4.0 |
 
-- OS: Ubuntu 24.04 LTS
-- Python: 3.12
-- CUDA toolkit: 12.8
-- PyTorch: CUDA 12.8 runtime wheels
-- GPU: Tesla V100 32 GB
+KV pool 651,884 tokens (19.9× @ 32k); prefill 213.7 t/s (2.4k prompt); weights
+8.91 GiB/card. Aggregate climbs past x8: at TP=2 per-card weight bytes are half
+the single-card case and GDDR5 streaming stays the binding limit until ~x16.
+TP=1 (single P40, GPU 4): x1 15.24 / x4 22.98 / x8 43.05, KV pool only 59,578
+(1.82× @ 32k) — the dequantized 17.7 GiB leaves little VRAM; fine for a few
+sessions, not a production shape. TP=4: x1 28.78 / x4 41.44 / x16 61.9, pool
+1,860,825 (56.8× @ 32k) — same ceiling as TP=2 (weight streaming), just more KV.
 
-## Quick Start
+Context-size effect, P40 pair (TP=2): **decode speed does not depend on ctx size**
+(the hybrid GDN state is fixed per sequence; only 16/64 layers scale with tokens).
+What ctx size changes is **capacity**: at 262k ctx the fp16-KV pool is
+730,333 tokens (2.79× @ 262k) while decode stays 23.37 t/s (x1) / 32.07 (x4) —
+identical to the 32k numbers above. ctx costs nothing at decode, everything at
+prefill and capacity.
 
-### 1. Install CUDA 12.8
+### Qwen3.5-9B on P100s (idx 5,6, TP=2) — P40 vs P100
 
-Use the official NVIDIA repository on Ubuntu 24.04:
+Same checkpoint, same flags, ctx 32768, KV fp16, graphs, warm cache:
 
-```bash
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt update
-sudo apt install -y cuda-toolkit-12-8
-```
+| conc | P40 x2 (0,1) | P100 x2 (5,6) | delta |
+|---|---|---|---|
+| x1 | 23.35 t/s | 27.88 t/s | +19% |
+| x2 | 17.65 t/s | 20.23 t/s | +14% |
+| x4 | 32.38 t/s | 36.91 t/s | +14% |
 
-If the machine also has another CUDA toolkit installed, force build-time and
-runtime CUDA to 12.8:
+KV pool on the 16 GB P100 pair @ 32k: 141,001 tokens (4.3×) vs 651,884 on the
+24 GB P40 pair.
 
-```bash
-export CUDA_HOME=/usr/local/cuda-12.8
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
-hash -r
-nvcc -V
-```
+Why the P100's ~3.7× bandwidth advantage only buys 15–22%: at TP=2 every decode
+step pays an NCCL allreduce; on the P40s weight streaming dominates so the
+collective is a small fraction of step time, on the P100s weights stream so fast
+that the fixed per-step sync cost becomes the binding limit (Amdahl on the
+collective). KV pool on the 16 GB P100 pair @ 32k: 226,397 tokens (6.9×); @ 8k:
+122–197k depending on boot.
 
-### 2. Create the Python environment
+### Qwen3.5-9B-w4a16 (TP=2 P40s)
 
-```bash
-source /path/to/miniconda3/etc/profile.d/conda.sh
-conda create -y -n 1cat-vllm-sm70 python=3.12
-conda activate 1cat-vllm-sm70
+This fork (prod wheel):
 
-python -m pip install --upgrade pip setuptools wheel
-```
+| conc | x1 | x2 | x4 | x8 |
+|---|---|---|---|---|
+| decode t/s (agg) | 11.2 | 13.9 | 18.1 | 19.5 |
 
-### 3. Install from Prebuilt Wheels
+Prefill 27.7 t/s (2.4k prompt). KV pool 909,560 (27.8× @ 32k), weights
+5.25 GiB/card.
 
-Prebuilt wheels are the recommended installation path for public users. Source
-builds are intended for kernel development.
+The symmetric checkpoint is **slower than its own FP8→FP16 sibling** (11.2 vs
+23.4 at x1): no qzeros ⇒ the custom GEMV's asymmetric gate fails, and 232
+BF16-retained modules mean int4 saves less bandwidth than expected while dequant
+ALU stays on the batch-1 critical path. INT4 only wins with near-total quant
+coverage (see 27B AWQ below).
 
-Download the latest wheel assets from:
+### Qwen3.8-27B-AWQ-INT4 (TP=2 P40s, +MTP k=2)
 
-```text
-https://github.com/1CatAI/1Cat-vLLM/releases/latest
-```
+| | before GEMV fix | with W4A16 GEMV (this fork) | llama.cpp Q4_0+MTP (same 2 cards) |
+|---|---|---|---|
+| x1 | 4.08 t/s | **13.2 t/s** | 13.6–13.7 t/s |
 
-Install the wheel from the directory where you downloaded it:
+The 4.08 was the engine, not the cards: eager dispatch + the stock Triton
+dequant-ALU GEMM. With the split-K CUDA GEMV (7× per-GEMM at M=1) and graphs,
+vLLM meets llama.cpp on the same hardware. The prefill block-cliff fix
+(48322deed) is what makes AWQ *prefill* usable at all (151-tok prompt:
+734 ms → 13 ms).
 
-```bash
-python -m pip install --prefer-binary --no-cache-dir \
-  --extra-index-url https://download.pytorch.org/whl/cu128 \
-  ./1cat_vllm-*.whl
-```
+(The experimental v1.3.0-merged wheel routed this checkpoint to
+`TritonW4A16LinearKernel` at 11.23 x1; that wheel is not in this branch —
+see the dead-ends note below for what that gap actually was.)
 
-Notes:
+### Qwen3.8-27B-FP8 (TP=4 P40s, +MTP k=2, graphs)
 
-- The `1cat_vllm` wheel already bundles the `flash_attn_v100` Python package
-  and SM70 CUDA extensions.
-- Runtime installation from wheels does not require the bundled `lmdeploy`
-  source tree.
-- Use Python 3.12 and CUDA 12.8.
-- If your shell has a broken local proxy configured, unset it before
-  installing:
-  `env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy ...`.
-- After installing from wheels, run `python -m vllm...` from a directory
-  outside this source checkout, such as `cd ~` or `cd /tmp`. Running inside the
-  cloned repository makes Python import the local source tree instead of the
-  wheel-installed CUDA extensions.
+| conc | decode t/s (agg) | per stream |
+|---|---|---|
+| x1 | 8.70 | 8.70 |
+| x2 | 12.51 | 6.3 |
+| x4 | 19.04 | 4.8 |
 
-### 4. Verify the Environment
+(warm cache; earlier same-flags runs: x1 7.41–7.57, x4 ~16.4–17.6 — the spread
+is the MTP acceptance variance between boots, not a config difference)
 
-```bash
-python - <<'PY'
-import torch, triton, vllm, sys
-import flash_attn_v100
-from flash_attn_v100 import flash_attn_v100_cuda, paged_kv_utils
-print("python", sys.version.split()[0])
-print("torch", torch.__version__)
-print("torch_cuda", torch.version.cuda)
-print("triton", triton.__version__)
-print("vllm", vllm.__version__)
-print("flash_attn_v100", flash_attn_v100.__version__)
-PY
-```
+Aggregate saturates ~16–19 t/s; the 3rd session is near-free, the 4th adds
+little; more sessions queue. FP8 on Pascal buys **footprint, not speed**: the
+dequant fallback leaves FP16 weights (2 bytes/weight) so the decode ceiling is the
+weight-streaming floor (~12 t/s best-case single). KV pool: 336,855 tokens @
+util 0.92 (10.3× @ 32k; earlier boots: 290k @ 0.85, 422k @ 0.92). MTP k=2
+acceptance ~80% (position 1 ~0.82) — a real but modest win on this checkpoint;
+`max_num_scheduled_tokens` auto-sets to 2048.
 
-## Recommended Launch Commands
+### Qwen3.8-27B-INT8-W8A16 (TP=4 P40s, ctx 32768)
 
-These are the recommended public serving commands for the 27B AWQ and 35B AWQ
-V100 profiles. When using prebuilt wheels, run them outside the source checkout
-so Python loads the installed package and its CUDA extensions.
+| config | x1 | x2 | x4 | x8 |
+|---|---|---|---|---|
+| eager (no MTP) | 15.28 | 22.95 | 29.21 | 29.27 |
+| **graphs (no MTP) — production (this wheel)** | **16.67** | — | **30.94** | 27.51 |
+| graphs + MTP k=2 | 7.92 | 9.88 | 9.21 | — |
 
-Use `CUDA_VISIBLE_DEVICES=0,1,2,3` only when you need to select a specific
-four-card V100 set.
+KV pool 769,683 tokens (23.5× @ 32k), weights 7.49 GiB/card, prefill 11.2 t/s
+(2.4k prompt).
 
-### Qwen3.6-27B-AWQ, TP4
+- int8 weights = half the bytes of the FP16-materialized FP8 build ⇒ **+24% x1 /
+  +11% x8** — exactly the halved-bandwidth prediction. Served by the stock Exllama
+  WNA16 kernel (no custom kernel needed).
+- MTP is a **loss** on this checkpoint even with graphs: acceptance 63–65% (K=2),
+  and the GDN draft loop can't be graphed so decode reverts to eager. K=1 gives
+  no meaningful single-stream gain. **Run it with no MTP.**
+- KV pool **815,559 tokens (24.9× @ 32k)** — int8 weights leave enormous VRAM for
+  KV. x32 aggregate ≈ 29.3 (identical to x8: the server saturates past 4 streams).
+- Coherence verified: Asimov's three laws of robotics recited exactly.
 
-```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model /path/to/Qwen3.6-27B-AWQ \
-  --served-model-name qwen3.6-27b-awq \
-  --trust-remote-code \
-  --attention-backend FLASH_ATTN_V100 \
-  --tensor-parallel-size 4 \
-  --gpu-memory-utilization 0.88 \
-  --max-model-len 262144 \
-  --max-num-seqs 4 \
-  --max-num-batched-tokens 8192 \
-  --enable-auto-tool-choice \
-  --tool-call-parser qwen3_coder \
-  --host 0.0.0.0 \
-  --port 8000
-```
+### FP8 KV alias on Pascal (this fork's signature feature)
 
-### Qwen3.6-35B-A3B-AWQ, TP4
+`--kv-cache-dtype fp8` on CC 6.x would normally die in the Triton compiler
+(`type fp8e4nv not supported in this architecture`). The fork remaps it to
+`int8_per_token_head` at config validation (one log line, no harness changes):
 
-```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model /path/to/Qwen3.6-35B-A3B-AWQ \
-  --served-model-name qwen3.6-35b-a3b-awq \
-  --trust-remote-code \
-  --attention-backend FLASH_ATTN_V100 \
-  --tensor-parallel-size 4 \
-  --gpu-memory-utilization 0.88 \
-  --max-model-len 262144 \
-  --max-num-seqs 1 \
-  --max-num-batched-tokens 8192 \
-  --host 0.0.0.0 \
-  --port 8000
-```
+| 9B FP8-dynamic TP=2 P40s, ctx 262144, util 0.95 | KV pool | @ 262k |
+|---|---|---|
+| `fp16` KV | 730,333 tokens | 2.79× |
+| `fp8` (aliased → int8 per-token-head) | **1,425,408 tokens** | **5.44×** |
 
-## OpenAI-Compatible Request Example
+Decode is identical across both (x1 23.37 vs 23.49, x4 32.07 vs 30.26) — the
+alias costs nothing at decode and roughly doubles 262k-session capacity.
+Verified identical pool between `--kv-cache-dtype fp8` and
+`--kv-cache-dtype int8_per_token_head` (byte-identical config path), and a
+41k-token coherence test passed on the aliased server.
 
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer EMPTY' \
-  -d '{
-    "model": "qwen3.6-27b-awq",
-    "messages": [{"role": "user", "content": "用一句话回答，2+2等于几？"}],
-    "temperature": 0,
-    "max_completion_tokens": 32,
-    "chat_template_kwargs": {"enable_thinking": false}
-  }'
-```
+## Dead ends (do not retry; full write-ups in the skill)
 
-If the response is coherent and short, the API path is basically healthy.
+- `--dtype float32`: OOM at profile on P100s (144 MiB alloc on 15.9 GiB); on P40s
+  it boots then dies on first request — `ChunkGatedDeltaRuleFunction does not
+  support float32`. **fp16 is the only working dtype on CC 6.x.**
+- **The "2.7× Exllama-v2 regression" was a benchmark-harness artifact, not a
+  kernel regression.** The experimental v1.3.0-merged wheel (dev388) showed
+  27B-INT8 at 6.18 vs 16.67 and 9B-W4A16 at 7.95 vs 11.2 x1. A controlled 2×2
+  A/B matrix (prod vs test venv × `language_model_only` on/off, identical
+  flags, same GPU pair, warm cache) showed the gap came from the comparison
+  runs using different serving configs (`language_model_only=True` +
+  `max_num_seqs=4` in prod vs none + `max_num_seqs=8` in the test harness),
+  not from kernels — `exllama.py` is **byte-identical** (same sha256) across
+  the pre-merge, merged, and prod trees. The merged wheel was therefore not
+  kept; this branch *is* the working prod tree. The merged line is preserved
+  as tag `legacy/a561ea8a1-preconsolidate` for reference.
+- FP8-dynamic and plain-fp16
+  checkpoints are unaffected (they don't touch the WNA16 path).
+- INT8-direct byte-resident GEMV (`w8a16_gemv_v8`): kernel proven bit-exact
+  offline and per-call, but server integration degenerates decode deterministically
+  at the first ~2 linears of each step (a second consumer reads the weight bytes).
+  Blocked, fully characterized.
+- DFlash2 parallel drafting: hard-blocked (non-causal attention only exists in
+  FlexAttention, which dies on hybrid GDN block sizes).
+- W16A16 split-K GEMV for the FP8 dequant path: unvalidated; FP8 TP=4 stays at the
+  cuBLAS-FP16 floor (~12 t/s ceiling single).
+- P100 fp8e4nv KV: same Triton rejection as P40 — the alias is the answer for both.
 
-## Experimental Features
+## Clone & build
 
-### FP8
+### Prerequisites (build machine — any 28-core/27 GB x86 box, no GPU needed)
 
-FP8 support is included for validation and research. It is not the stable
-public default.
+- Ubuntu 24.04 / Debian 13, gcc 12.2+, `apt install cuda-toolkit-12.4` (compiler
+  only; `CUDA_HOME=/usr/local/cuda`), uv, git.
+- Python 3.13.
 
-- FP8 model execution on V100 is experimental.
-- `fp8_e5m2` KV cache can be used experimentally on V100.
-- `fp8_e4m3` is not the recommended V100 option in the current path.
-- Do not add `--calculate-kv-scales` unless you are specifically testing KV
-  scale calculation behavior.
+### Step 0 — torch from source (one-time; ~1 h on 28 cores)
 
-Example:
-
-```bash
---kv-cache-dtype fp8_e5m2
-```
-
-### DFlash
-
-DFlash is included as an experimental path for continued validation. Treat it
-as a research feature until you have validated speed and output quality on your
-own workload.
-
-### MTP
-
-MTP is not enabled by default in the V100 public serving profile. Long-context
-decode on V100 can slow down significantly when MTP is enabled, so keep the
-default no-MTP path for 128K/256K style serving unless your own workload proves
-otherwise.
-
-To explicitly test the previous automatic SM70 MTP4 profile:
+vLLM pins `torch==2.10.0`; the PyPI wheel is cu128 and won't run on our
+550-series driver, so we build torch once with cu124 + Pascal archs:
 
 ```bash
-export VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS=1
+git clone -b v2.10.0 --depth 1 https://github.com/pytorch/pytorch /opt/torch-src/pytorch
+uv venv --python 3.13 /opt/torch-build-env
+# the FULL pyproject [build-system] requires list — missing `packaging` is a
+# SILENT total killer (gen_torch_version CMake step dies every attempt):
+uv pip install --python /opt/torch-build-env/bin/python \
+    cmake ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" \
+    "setuptools-scm>=8.0" wheel jinja2 requests "typing-extensions>=4.10.0" six
+cd /opt/torch-src/pytorch
+# build WITH NCCL (the old recipe used USE_NCCL=0 — that is the root of the
+# vLLM gloo-fallback CPU burn):
+CMAKE_BUILD_PARALLEL_LEVEL=8 NVCC_THREADS=1 \
+TORCH_CUDA_ARCH_LIST="6.0;6.1" \
+PYTORCH_BUILD_VERSION=2.10.0 \
+python setup.py bdist_wheel
+# → dist/torch-2.10.0-cp313-*.whl (355 MB). OOM-aware retry: halve
+# CMAKE_BUILD_PARALLEL_LEVEL on code=137; the build tree is resumable.
 ```
 
-You can also pass an explicit `--speculative-config` when you want full control
-over speculative decoding settings.
-
-### Dense F16 Fast Path
-
-`VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` is intended for targeted experiments.
-Keep it disabled for public MoE serving profiles unless you are explicitly
-benchmarking that path.
-
-## Source Build
-
-Source build is supported, but it is **not recommended** for normal runtime
-deployment. Install the release wheels first unless you are changing CUDA,
-C++, or Triton code.
-
-This repository includes the validated `lmdeploy` source tree under
-`csrc/sm70_turbomind/lmdeploy`, which is needed by the SM70 AWQ build path.
+### Step 1 — build the vLLM-Pascal wheel
 
 ```bash
-cd /path/to/1Cat-vLLM/vllm
-test -d csrc/sm70_turbomind/lmdeploy
+git clone https://github.com/Mikec78660/vLLM-Pascal /opt/1Cat-vLLM
+cd /opt/1Cat-vLLM   # default branch: pascal (the working code)
+uv venv --python 3.13 /opt/vllm-build-env
+uv pip install --python /opt/vllm-build-env/bin/python \
+    cmake ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" \
+    "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" wheel jinja2 regex protobuf build
+# the custom torch wheel (satisfies the fork's torch==2.10.0 pin) + build-time deps:
+uv pip install --python /opt/vllm-build-env/bin/python --no-deps \
+    /opt/torch-src/pytorch/dist/torch-2.10.0-cp313-*.whl
+uv pip install --python /opt/vllm-build-env/bin/python \
+    numpy sympy networkx filelock typing-extensions fsspec
+
+export CUDA_HOME=/usr/local/cuda
+export TORCH_CUDA_ARCH_LIST="6.0;6.1"      # P100 + P40 — the whole point
+export VLLM_SKIP_SM70_BUNDLES=1            # don't build SM70-only bundles
+export VLLM_REQUIRE_RUST_FRONTEND=0
+export CMAKE_BUILD_TYPE=Release
+MAX_JOBS=8 NVCC_THREADS=1 \
+/opt/vllm-build-env/bin/python setup.py bdist_wheel
+# OOM (27 GB box): on code=137 halve MAX_JOBS (floor 2), NVCC_THREADS=1.
+# → dist/1cat_vllm-<git-describe>.cu124-cp313-cp313-linux_x86_64.whl
 ```
 
-Install build dependencies:
+Key compile facts: `setup.py` imports torch at module top ⇒ `--no-build-isolation`
+(or the venv approach above) is mandatory; `VLLM_SKIP_SM70_BUNDLES=1` wraps the
+unconditional SM70 bundle steps; CMake's `CUDA_SUPPORTED_ARCHS` is patched in
+**two** if-branches (CUDA-12 path + fallback); the wheel embeds only sm_60/61
+(verify: `python -c "import vllm._C"` + `strings vllm/_C.abi3.so | grep -c sm_7` → 0).
+
+### Step 2 — deploy on the GPU host (no CUDA toolkit needed)
 
 ```bash
-source /path/to/miniconda3/etc/profile.d/conda.sh
-conda activate 1cat-vllm-sm70
-
-python -m pip install -r requirements/build/cuda.txt
-python -m pip install -r requirements/cuda.txt
-python -m pip install -r requirements/common.txt
-python -m pip install cmake build
+# runtime host: driver 550.x, python3.13, uv. Triton 3.6.0 is self-contained
+# (bundles ptxas + libtriton; NEEDED = libz/libtinfo/libm/libc only).
+uv venv --python 3.13 /opt/1Cat-vLLM/venv
+uv pip install --python /opt/1Cat-vLLM/venv/bin/python --no-deps \
+    /path/to/1cat_vllm-<git-describe>.cu124-cp313-cp313-linux_x86_64.whl
+uv pip install --python /opt/1Cat-vLLM/venv/bin/python --no-deps \
+    /path/to/torch-2.10.0-cp313-*.whl
+# torch's nvidia-* runtime pins: parse the torch wheel's METADATA
+# Requires-Dist and install those exact versions (12.4 series:
+# cufft 11.2.3.61, curand 10.3.4.107, cusolver 11.5.3.52, cusparse 12.3.1.170,
+# cublas/cudnn/cupti/nvjitlink 12.4.x) + triton==3.6.0 + the remaining
+# runtime deps (all py3-none or cp313 wheels — no compilation).
+echo "/opt/1Cat-vLLM/venv/lib/python3.13/site-packages/nvidia/*/lib" \
+    > /etc/ld.so.conf.d/1cat-vllm.conf && ldconfig
+# smoke test:
+/opt/1Cat-vLLM/venv/bin/python -c "
+import vllm, torch
+from vllm.platforms import current_platform
+print(vllm.__version__, torch.version.cuda,
+      current_platform.get_device_capability())
+from vllm.v1.attention.selector import current_platform as p
+print(p.get_attn_backend_cls(...))   # expect TRITON_ATTN on Pascal
+"
 ```
 
-Build wheels:
+### Step 3 — serve (canonical launch)
 
 ```bash
-export CUDA_HOME=/usr/local/cuda-12.8
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
-export TORCH_CUDA_ARCH_LIST="7.0;8.0"
-export FLASH_ATTN_V100_CUDA_ARCH_LIST="7.0"
-export MAX_JOBS=12
-export NVCC_THREADS=1
-
-rm -rf build vllm.egg-info
-rm -rf .deps/*-build .deps/*-subbuild
-
-pushd flash-attention-v100
-python -m build --wheel --no-isolation --outdir ../dist-cu128-sm70
-popd
-
-python -m build --wheel --no-isolation --outdir dist-cu128-sm70
+# CUDA_DEVICE_ORDER=PCI_BUS_ID is REQUIRED on this LXC: the default CUDA device
+# ordering is NOT PCI-bus order, so without it CUDA_VISIBLE_DEVICES=0,1 selects
+# the wrong physical GPUs.
+# TRITON_CACHE_DIR pins the JIT cache (the box keeps it at /root/.triton-cache);
+# a warm cache makes a reboot start in ~40 s instead of a 5-15 min JIT storm.
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=0,1 \
+TRITON_CACHE_DIR=/root/.triton-cache \
+/opt/1Cat-vLLM/venv/bin/vllm serve /AI/models/Qwen3.8-27B-INT8-W8A16-MTP \
+  --served-model-name qwen3.8-27b-int8 \
+  --quantization compressed-tensors \
+  --tensor-parallel-size 2 \
+  --dtype float16 \
+  --max-model-len 32768 --max-num-seqs 8 \
+  --kv-cache-dtype int8_per_token_head \
+  --gpu-memory-utilization 0.92 \
+  --compilation-config '{"mode":0,"cudagraph_mode":"FULL"}' \
+  --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+  --host 0.0.0.0 --port 8905
+# NOTE: Pascal (sm_60/61) has NO FP8, so the KV cache is int8_per_token_head
+# (per-token-head scales; ~2x KV pool vs fp16). Fork builds with the fp8 alias (this build)
+# also accept `fp8` as an alias for int8_per_token_head, but the older dev2
+# build does NOT have that alias — pass int8_per_token_head explicitly so this
+# block works on any build of the fork. Do NOT pass --enforce-eager.
 ```
 
-For editable development:
+Launchers for the tested configs live in `benchmarks/pascal/`
+(`launch-fp8-mtp.sh`, `launch-awq-mtp.sh`, `launch-awq-mtp-cg.sh`).
 
-```bash
-python -m pip install -e . --no-build-isolation
-```
+## Operational notes (learned the hard way)
 
-## Benchmarking Notes
+- **Cold boot is slow, not broken.** Fresh Triton cache + CUDA-graph capture =
+  ~5–15 min on this 8-thread LXC (27B: `init engine ... took 808 s`). During
+  that window the EngineCore logs `No available shared memory broadcast block
+  found in 60 seconds` every minute and workers sit at 0% GPU — a **normal**
+  phase. Do not kill the server for it; the port binds after "startup complete".
+- **Kill by process group, never by parent PID.** The `vllm serve` parent and the
+  `VLLM::EngineCore`/worker tree are separate; killing only the parent orphans the
+  engine (it keeps loading, holds all the VRAM, and its port never comes up).
+- **Stale `/dev/shm/psm_*`** from killed servers starve the next boot's broadcast
+  pool — `rm -f /dev/shm/psm_*` only when the box is otherwise clean.
+- **Never benchmark two servers at once** on this box (shared CPU + PCIe/SHM).
+- **DVFS:** idle P40s sit at P8 (~1.2 GHz/715 MHz); the first bench after boot can
+  read ~12% low. Warmup requests absorb this.
+- Tool calls: the fork has **no plain `qwen` parser**; Qwen3.x instruct =
+  `--tool-call-parser qwen3_xml` (with `hermes` you get HTTP 200 but the raw
+  markup in `content` and empty `tool_calls` — a structurally wrong answer).
 
-- First-request warmup is slow on V100 and should not be included in
-  steady-state throughput.
-- Browser-side OpenAI streaming throughput includes request overhead and should
-  not be compared directly with strict incremental decode TPS.
-- Long-context throughput depends strongly on TP, `max_num_seqs`,
-  `max_num_batched_tokens`, prompt shape, and attention backend.
-- If you publish a baseline, include the full launch command, GPU model,
-  driver, CUDA runtime, model checkpoint, sampling parameters, prompt length,
-  and decode length.
+## Branches
 
-## WeChat Community
+| branch | state |
+|---|---|
+| `pascal` | **canonical**: the working prod code — pre-upstream-merge Pascal fork + the 12 hand-tuned kernel files + 5 custom GEMV kernels (committed `.so`) + vendored `triton_kernels` + fp8→int8 KV alias. This is exactly what runs 16.67 t/s in prod. |
 
-**群聊：** 1Cat-vLLM 开源交流群
+The experimental v1.3.0 upstream merge (which added the Exllama-v2 kernel set and
+399 SM70 files) is **not** in this branch. Its tip is preserved as tag
+`legacy/a561ea8a1-preconsolidate` if you ever want to diff against it.
 
-请使用微信扫描下方二维码加入群组：
-
-![1Cat-vLLM 微信交流群二维码](docs/assets/wechat-group-qr-6.png)
-
-> 提示：微信群二维码通常 7 天内有效。若扫描失败或提示过期，请联系微信号：YM_isi。
-
-## Roadmap
-
-1Cat-vLLM will continue to prioritize Tesla V100 / SM70, making modern LLM inference more usable, stable, and deployable on existing GPUs.
-
-- **Near term:** Complete Volta compatibility and validation for DeepSeek V4, GLM5, and other new model families, while improving long-context serving, quantization, multi-GPU parallelism, and runtime stability.
-- **Mid term:** Expand the Volta model support matrix with a focus on models up to 300B parameters, backed by reproducible performance, quality, and release validation.
-- **Long term:** Build on the Volta foundation and extend hardware support in stages: **Volta → Turing/Ampere → CDNA**, bringing sustainable LLM inference to a broader range of existing accelerators.
-
-
-## Repository Notes
-
-- This fork focuses on SM70 quantized inference, V100-oriented attention and
-  long-context tuning, model-specific runtime and deployment paths, and
-  continued MTP and DFlash research.
-- Production status is route-specific. Use the documented public profiles and
-  validated release matrices as the source of truth.
-
-## Acknowledgements
-
-- [vLLM](https://github.com/vllm-project/vllm)
-- [lmdeploy / TurboMind](https://github.com/InternLM/lmdeploy)
-- [flash-attention-v100](https://github.com/ai-bond/flash-attention-v100)
-- [marlin_v100](https://github.com/zhinianqin/marlin_v100)
-
-## License
-
-This repository follows the upstream vLLM license model. See [LICENSE](LICENSE).
+Upstream: `origin` → 1CatAI/1Cat-vLLM (read-only for us; push 403).
+This repo is a fork of it.

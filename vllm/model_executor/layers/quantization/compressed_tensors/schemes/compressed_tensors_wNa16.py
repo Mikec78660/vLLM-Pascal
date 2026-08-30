@@ -84,8 +84,9 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             or sm70_tm.forces_marlin()
         ):
             return 70
-        # Turing and up
-        return 75
+        # [PASCAL] "Turing and up" (75) blocked CC 6.x; this scheme runs on
+        # Pascal via TritonW4A16LinearKernel (min cap 0). Lower to 60.
+        return 60
 
     def create_weights(
         self,

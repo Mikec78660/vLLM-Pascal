@@ -1040,3 +1040,22 @@ class Platform:
 class UnspecifiedPlatform(Platform):
     _enum = PlatformEnum.UNSPECIFIED
     device_type = ""
+
+
+# 1CAT-VLLM-PASCAL-EAGER-START
+# --- 1Cat-vLLM Pascal compatibility (PATCH 5) ---
+# torch.compile backend 'inductor' -> 'eager' when every CUDA GPU in this
+# process is pre-compute-7.0 (P40/P100). Inductor needs Triton, which needs
+# CC >= 7.0; on Pascal explicit @torch.compile sites (embedding mask fusion,
+# logprobs, samplers) otherwise crash with GPUTooOldForTriton. Runs at import
+# time, before any model module evaluates its compile decorators.
+try:
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        if min(
+            torch.cuda.get_device_capability(i)[0]
+            for i in range(torch.cuda.device_count())
+        ) < 7:
+            Platform.simple_compile_backend = "eager"
+except Exception:
+    pass
+# --- 1Cat-vLLM Pascal compatibility (PATCH 5) end ---

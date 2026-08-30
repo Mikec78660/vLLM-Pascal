@@ -1302,11 +1302,13 @@ package_data = {
         "ops/gated_delta_rule/chunk/sm70/csrc/*.cu",
         "ops/gated_delta_rule/chunk/sm70/*.so",
     ],
-    "flash_attn_v100": [
-        "*.so",
-    ],
     "vllm": [
         "py.typed",
+        # Pascal hand-built GEMV kernels (loaded via importlib at runtime)
+        "model_executor/kernels/linear/mixed_precision/*.so",
+        "model_executor/layers/quantization/*.so",
+        # vendored triton_kernels (required by 25 vllm modules on Pascal)
+        "third_party/triton_kernels/**",
         "assets/*.pt",
         "libs/*.so*",
         "model_executor/layers/fused_moe/configs/*.json",
@@ -1373,10 +1375,8 @@ rust_extensions = [
 setup(
     # static metadata should rather go in pyproject.toml
     version=get_vllm_version(),
-    packages=(find_packages(include=["vllm*", "flash_qla*"]) + ["flash_attn_v100"]),
-    package_dir={
-        "flash_attn_v100": str(FLASH_ATTN_V100_PACKAGE),
-    },
+    packages=find_packages(include=["vllm*", "flash_qla*"]),
+    package_dir={},
     ext_modules=ext_modules,
     rust_extensions=rust_extensions,
     install_requires=get_requirements(),

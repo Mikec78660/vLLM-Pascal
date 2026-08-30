@@ -107,7 +107,12 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 70
+        # [PASCAL] 70 blocked CC 6.x (P40/P100). W4A16 linears run on Pascal
+        # via TritonW4A16LinearKernel (min cap 0, pure Triton) / Exllama
+        # (min cap 60, stable-lib gptq_gemm), so the config-level gate in
+        # vllm/config/vllm.py must not reject CC 6.x before the kernel oracle
+        # can choose them.
+        return 60
 
     def get_name(self) -> QuantizationMethods:
         return "compressed-tensors"

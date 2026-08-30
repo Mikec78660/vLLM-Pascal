@@ -371,9 +371,11 @@ class NCCLLibrary:
                                 func.name,
                                 so_file,
                             )
-                        if current_platform.is_rocm():
-                            # Having an exception here on ROCm platform is
-                            # not allowed during graph capturing
+                        # Tolerate missing symm-mem symbols (NCCL < 2.27) unless the
+                        # user explicitly requested VLLM_USE_NCCL_SYMM_MEM. Needed for
+                        # older host NCCL (e.g. 2.22.3 on Pascal) which lacks
+                        # ncclCommWindowRegister/Deregister.
+                        if current_platform.is_rocm() or not envs.VLLM_USE_NCCL_SYMM_MEM:
                             continue
                     raise
             NCCLLibrary.path_to_dict_mapping[so_file] = _funcs

@@ -42,10 +42,26 @@ from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 logger = init_logger(__name__)
 
 torch._dynamo.config.recompile_limit = 16
-create_block_mask_compiled = torch.compile(
-    create_block_mask, fullgraph=True, mode="reduce-overhead"
-)
-flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
+# Pascal (SM6.x) bridge: inductor emits Triton kernels (GPUTooOldForTriton).
+# Route both compiled entry points through the platform compile backend,
+# which the fork pins to "eager" on CC<7 (see platforms/interface.py).
+from vllm.platforms import current_platform as _curplat
+
+if (_curplat.is_cuda()
+        and _curplat.get_device_capability() is not None
+        and _curplat.get_device_capability().to_int() < 70):
+    _be = getattr(_curplat, "simple_compile_backend", "eager")
+    create_block_mask_compiled = torch.compile(
+        create_block_mask, fullgraph=True, backend=_be
+    )
+    flex_attention_compiled = torch.compile(
+        flex_attention, fullgraph=True, backend=_be
+    )
+else:
+    create_block_mask_compiled = torch.compile(
+        create_block_mask, fullgraph=True, mode="reduce-overhead"
+    )
+    flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
 
 
 def _offsets_to_doc_ids_tensor(
@@ -876,7 +892,20 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             )
 
         kv_block_size = attn_cfg.flex_attn_kv_block_size or kv_block_size
-        if (kv_block_size & (kv_block_size - 1)) != 0 or (
+        # Pascal (SM6.x) bridge: the hybrid GDN target's mamba-aligned KV
+        # block (e.g. 832) is not a power of 2. FlexAttention block masks are
+        # built from q/kv indices directly here, so a non-pow2 kv block is
+        # functionally fine as long as flex_attn_block_n is None; round the
+        # kernel tile up instead of raising.
+        if (kv_block_size & (kv_block_size - 1)) != 0:
+            import os as _os
+            if _os.environ.get("VLLM_FLEX_NON_POW2_KV", "1") == "0":
+                raise ValueError(
+                    f"flex_attn_kv_block_size must be a power of 2 "
+                    f"and divisible by flex_attn_block_n, got "
+                    f"{kv_block_size}, {attn_cfg.flex_attn_block_n}"
+                )
+        elif (
             attn_cfg.flex_attn_block_n is not None
             and kv_block_size % attn_cfg.flex_attn_block_n != 0
         ):

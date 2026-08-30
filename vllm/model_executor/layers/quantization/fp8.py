@@ -1,4 +1,59 @@
 # SPDX-License-Identifier: Apache-2.0
+
+# --- Pascal W16A16 split-K decode GEMV (2026-08-23) ---
+# After the SM70 FP8 dequant-fallback materializes fp16 weights, skinny-M
+# cuBLAS runs them at ~74 GB/s effective on P40. This GEMV streams the same
+# [K,N] k-major weights at 300-400 GB/s for M<=4 (measured, real shapes).
+_W16A16_GEMV = None
+_W16A16_PARTIAL_CACHE: dict = {}
+
+
+def _get_w16a16_gemv():
+    global _W16A16_GEMV
+    if _W16A16_GEMV is None:
+        try:
+            import importlib.util as _ilu
+            import os as _os
+            _so = _os.path.join(
+                _os.path.dirname(_os.path.abspath(__file__)), "w16a16_gemv.so"
+            )
+            if _os.path.exists(_so):
+                _spec = _ilu.spec_from_file_location("w16a16_gemv", _so)
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                _W16A16_GEMV = _mod.w16a16_gemv
+            else:
+                _W16A16_GEMV = False
+        except Exception:
+            _W16A16_GEMV = False
+    return _W16A16_GEMV or None
+
+
+def _w16a16_apply(x, w_kn, bias):
+    """x:[M,K] fp16, w_kn:[K,N] fp16 k-major -> [M,N]; None = no fast path."""
+    ext = _get_w16a16_gemv()
+    if ext is None or x.dtype != torch.float16 or x.ndim != 2:
+        return None
+    M, N = x.shape[0], w_kn.shape[1]
+    if M < 1 or M > 4:
+        return None
+    S, blk = (32, 128) if M == 1 else (32, 256)
+    if w_kn.shape[0] % S:
+        return None
+    key = (S, N)
+    partial = _W16A16_PARTIAL_CACHE.get(key)
+    if partial is None:
+        if len(_W16A16_PARTIAL_CACHE) > 64:
+            _W16A16_PARTIAL_CACHE.clear()
+        partial = torch.empty(
+            S, 4, N, dtype=torch.float32, device=w_kn.device
+        )
+        _W16A16_PARTIAL_CACHE[key] = partial
+    out = ext(x.contiguous(), w_kn, S, partial, blk)
+    if bias is not None:
+        out = out + bias
+    return out
+
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import TYPE_CHECKING, Any
@@ -200,6 +255,11 @@ class Fp8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
+        # Pascal (CC 6.x): supported via the load-time dequant fallback
+        # (fp8 block weights -> orig dtype; plain F.linear at runtime).
+        cap = current_platform.get_device_capability()
+        if current_platform.is_cuda() and cap is not None and cap[0] == 6:
+            return 60
         if (
             current_platform.is_cuda()
             and current_platform.has_device_capability(70)
@@ -379,19 +439,27 @@ class Fp8LinearMethod(LinearMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
         self.act_q_static = self.quant_config.activation_scheme == "static"
+        _cap = current_platform.get_device_capability() if current_platform.is_cuda() else None
         self._sm70_without_fp8_hw = (
-            current_platform.is_cuda()
-            and current_platform.has_device_capability(70)
-            and not current_platform.has_device_capability(75)
+            (
+                current_platform.is_cuda()
+                and current_platform.has_device_capability(70)
+                and not current_platform.has_device_capability(75)
+            )
+            or (_cap is not None and _cap[0] == 6)
         )
+        # Pascal (CC 6.x): always dequant-fallback. The TurboMind W8A16 CUDA
+        # kernels are built for sm_70+ only, so they must never be selected here.
+        _is_pascal = _cap is not None and _cap[0] == 6
         self.use_sm70_dequant_fallback = (
             self._sm70_without_fp8_hw
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
-            and not sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+            and (_is_pascal or not sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND))
             and not sm70_tm.forces_marlin()
         )
         self.use_sm70_fp8_turbomind = (
             self._sm70_without_fp8_hw
+            and not _is_pascal
             and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             and self.block_quant
             and self.weight_block_size == [128, 128]
@@ -655,6 +723,14 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight = self._dequantize_block_weight(
                     weight, weight_scale_inv, layer.orig_dtype
                 )
+                if (
+                    weight.dtype == torch.float16
+                    and weight.dim() == 2
+                    and weight.size(0) % 8 == 0
+                    and _get_w16a16_gemv() is not None
+                ):
+                    weight = weight.t().contiguous()
+                    layer.sm70_w16_gemv = True
                 replace_parameter(layer, "weight", weight)
                 layer.input_scale = None
                 logger.warning_once(
@@ -840,7 +916,19 @@ class Fp8LinearMethod(LinearMethodBase):
             return out
 
         if self.use_sm70_dequant_fallback:
-            return torch.nn.functional.linear(x, layer.weight, bias)
+            w = layer.weight
+            if getattr(layer, "sm70_w16_gemv", False) and x.dim() == 2:
+                if x.shape[0] <= 4:
+                    out = _w16a16_apply(x, w, bias)
+                    if out is not None:
+                        return out
+                else:
+                    # prefill: plain matmul over the [K, N] layout
+                    out = torch.matmul(x, w)
+                    if bias is not None:
+                        out = out + bias
+                    return out
+            return torch.nn.functional.linear(x, w, bias)
 
         # if batch invariant mode is enabled, prefer direct FP8 path
         # we will use BF16 dequant when direct FP8 is not supported.

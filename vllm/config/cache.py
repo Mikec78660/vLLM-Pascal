@@ -261,6 +261,33 @@ class CacheConfig:
     @field_validator("cache_dtype", mode="after")
     @classmethod
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
+        # Pascal (CC 6.x) alias: fp8 KV -> int8_per_token_head.
+        # Triton 3.4 cannot compile fp8e4nv (what the fp8 family maps to) on
+        # SM6.x, so --kv-cache-dtype fp8* fails at init on Pascal with
+        # "type fp8e4nv not supported in this architecture". int8 is a
+        # complete first-class mode in this fork (per-token-head dynamic
+        # scales, supported by triton_reshape_and_cache_flash and the
+        # TRITON_ATTN decode kernel) and uses the same 1 byte/token, so the
+        # remap preserves the memory saving with better precision (7-bit
+        # int8 mantissa vs 3-bit fp8_e4m3) and no accuracy regression.
+        # Function-local import: vllm.platforms pulls in vllm.config, so an
+        # import at module top would risk a circular import.
+        if str(cache_dtype).startswith("fp8"):
+            from vllm.platforms import current_platform as _pascal_plat
+
+            if _pascal_plat.is_cuda():
+                _cap = _pascal_plat.get_device_capability()
+                if _cap is not None and _cap.to_int() < 70:
+                    logger.warning(
+                        "Pascal (CC 6.x): kv_cache_dtype=%s remapped to "
+                        "int8_per_token_head. Triton cannot compile fp8e4nv "
+                        "on SM6.x; int8 per-token-head uses the same "
+                        "1 byte/token with per-token-head fp32 scales and "
+                        "better precision. Set kv_cache_dtype explicitly to "
+                        "int8_per_token_head to silence this.",
+                        cache_dtype,
+                    )
+                    return "int8_per_token_head"
         if kv_cache_uses_per_token_head_scales(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "
