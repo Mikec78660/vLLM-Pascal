@@ -498,3 +498,27 @@ The experimental v1.3.0 upstream merge (which added the Exllama-v2 kernel set an
 
 Upstream: `origin` → 1CatAI/1Cat-vLLM (read-only for us; push 403).
 This repo is a fork of it.
+
+## NIXL KV-transfer pair (Qwen3.5-9B-w4a16, 4x P40)
+
+Working 2026-08-31: two NixlConnector engines (`kv_role=kv_both`), each
+TP=2 on a P40 pair, 16k context, `int8_per_token_head` 8-bit KV cache.
+Launch: `bash scripts/vllm-nixl-launch.sh`.
+
+Three non-obvious requirements (full rationale in the script header):
+
+1. **`VLLM_SSM_CONV_STATE_LAYOUT=DS`** — GDN (Qwen3.5 Mamba-conv) +
+   NixlConnector asserts this at worker init; the 3-read conv transfer
+   needs dim-first layout. Default `SD` = instant `AssertionError`.
+2. **`--compilation-config '{"mode":0,"cudagraph_mode":"FULL"}'`** — no
+   Dynamo; torch 2.10 hard-raises on the GDN layernorm Triton launch
+   (`_cuda_getCurrentRawStream` returns int) when the default `-O2`
+   VLLM_COMPILE mode traces it. GDN auto-downgrades to FULL_DECODE_ONLY.
+3. **Distinct `VLLM_NIXL_SIDE_CHANNEL_PORT` per engine** (5600/5601) —
+   both engines are `data_parallel_index 0`; the default port collides.
+
+Model is **w4a16** (ExllamaLinearKernel, 5.25 GiB/P40 at TP=2), not
+FP8-dynamic (17.73 GiB fp16-materialized) — the latter + 1 GB NIXL buffer
++ KV cache exceeds 24 GB. Observed per-P40 at TP=2: weights 5.25 GiB +
+graphs 0.63 GiB + int8 KV 14.2 GiB (1.5M tokens) + NIXL 1 GB ~= 21-22.5 GiB.
+
