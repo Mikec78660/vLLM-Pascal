@@ -266,6 +266,13 @@ Verified identical pool between `--kv-cache-dtype fp8` and
 
 ### Step 0 — torch from source (one-time; ~1 h on 28 cores)
 
+**If you already have the wheel, skip this step.** The source-built wheel
+`torch-2.10.0-cp313-cp313-linux_x86_64.whl` (cu124, archs 6.0;6.1, NCCL
+included, built 2026-08-22) lives at
+`llama-cpp-dev.lan:/opt/torch-2.10.0-nccl.whl` — just copy it to
+`/opt/torch-src/pytorch/dist/` to match the Step 1 layout. Rebuild from
+source only if you need a different arch list or NCCL config.
+
 vLLM pins `torch==2.10.0`; the PyPI wheel is cu128 and won't run on our
 550-series driver, so we build torch once with cu124 + Pascal archs:
 
@@ -335,17 +342,33 @@ uv pip install --python /opt/1Cat-vLLM/venv/bin/python --no-deps \
 # cufft 11.2.3.61, curand 10.3.4.107, cusolver 11.5.3.52, cusparse 12.3.1.170,
 # cublas/cudnn/cupti/nvjitlink 12.4.x) + triton==3.6.0 + the remaining
 # runtime deps (all py3-none or cp313 wheels — no compilation).
+# torchvision is REQUIRED for the Qwen3.5/3.8 VL model files: the model
+# registry inspects the arch in a subprocess that imports
+# image_processing_qwen2_vl -> torchvision.transforms at module import.
+# Missing it dies at boot ("Error in inspecting model architecture").
+# ALWAYS --no-deps: a bare install lets the resolver upgrade torch to the
+# PyPI version and clobbers the hand-built Pascal wheels.
+uv pip install --python /opt/1Cat-vLLM/venv/bin/python --no-deps \
+    torchvision==0.25.0
 echo "/opt/1Cat-vLLM/venv/lib/python3.13/site-packages/nvidia/*/lib" \
     > /etc/ld.so.conf.d/1cat-vllm.conf && ldconfig
-# smoke test:
+# smoke test (verified against the dev5 wheel):
 /opt/1Cat-vLLM/venv/bin/python -c "
-import vllm, torch
+import torch, vllm
+from vllm.benchmarks.lib.utils import default_vllm_config
 from vllm.platforms import current_platform
+from vllm.v1.attention.selector import AttentionSelectorConfig
+from vllm.v1.attention.backend import AttentionType
 print(vllm.__version__, torch.version.cuda,
       current_platform.get_device_capability())
-from vllm.v1.attention.selector import current_platform as p
-print(p.get_attn_backend_cls(...))   # expect TRITON_ATTN on Pascal
-"
+with default_vllm_config():
+    cfg = AttentionSelectorConfig(head_size=128, dtype=torch.float16,
+        kv_cache_dtype='float16', block_size=16, use_mla=False, has_sink=False,
+        use_sparse=False, use_mm_prefix=False, use_per_head_quant_scales=False,
+        attn_type=AttentionType.DECODER, use_non_causal=False,
+        use_batch_invariant=False, use_kv_connector=False)
+    print(current_platform.get_attn_backend_cls(None, cfg, num_heads=24))
+"   # expect TRITON_ATTN on Pascal
 ```
 
 ### Step 3 — serve (canonical launch)
