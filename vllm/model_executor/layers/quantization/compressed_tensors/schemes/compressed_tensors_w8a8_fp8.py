@@ -199,23 +199,29 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 raise RuntimeError(
                     "CT W8A8 Pascal fallback: unsupported weight_scale shape "
                     f"{tuple(s.shape)} for weight {tuple(w.shape)}")
-            # dual residency: fp16 [N,K] for prefill + any consumer;
-            # int8 bytes [K,N] + fp16 scales [N] feed the decode GEMV
-            # (half the DRAM traffic per generated token)
+            # DEFAULT (verified): fp16 [N,K] materialization, plain F.linear
+            # in apply_weights. The INT8-direct decode GEMV is PARKED
+            # (known corrupt decode; see skill ct-w8a8-pascal-dequant-
+            # fallback.md) and is opt-in only.
             w16 = (w.to(torch.float32) * s.to(torch.float32)).half()
             layer.weight = Parameter(w16.contiguous().data,
                                      requires_grad=False)
-            w8b = w.view(torch.int8).t().contiguous()
-            sc16 = s.reshape(-1).to(torch.float16).contiguous()
-            layer.w8_bytes = Parameter(w8b.data, requires_grad=False)
-            layer.w8_scales = Parameter(sc16.data, requires_grad=False)
             layer.input_scale = None
             self._pascal_dequant_fallback = True
-            self._pascal_int8_direct = True
-            mod = _get_w8a16_gemv()
-            lut = torch.arange(256, dtype=torch.uint8).view(
-                torch.float8_e4m3fn).to(torch.float32)
-            mod.build_e4m3_lut(lut.cpu())
+            self._pascal_int8_direct = (
+                os.environ.get("VLLM_CT_W8A8_GEMV", "0") == "1")
+            if self._pascal_int8_direct:
+                # dual residency: int8 bytes [K,N] + fp16 scales [N] feed
+                # the decode GEMV (half the DRAM traffic per token)
+                w8b = w.view(torch.int8).t().contiguous()
+                sc16 = s.reshape(-1).to(torch.float16).contiguous()
+                layer.w8_bytes = Parameter(w8b.data, requires_grad=False)
+                layer.w8_scales = Parameter(sc16.data, requires_grad=False)
+                mod = _get_w8a16_gemv()
+                lut = torch.arange(256, dtype=torch.uint8).view(
+                    torch.float8_e4m3fn).to(torch.float32)
+                # v11 binding asserts is_cuda() -- pass it on device
+                mod.build_e4m3_lut(lut.to(w.device))
             return
         if self.strategy == QuantizationStrategy.TENSOR:
             weight, weight_scale, input_scale = process_fp8_weight_tensor_strategy(
