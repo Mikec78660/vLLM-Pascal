@@ -370,6 +370,9 @@ wheel:
     # 3. the curated runtime deps — committed in this repo (the exact set the
     #    known-good venv was built from; all py3-none/cp313 wheels, no compile):
     uv pip install --python $V --no-deps -r requirements/runtime_pascal.txt
+    # (for a BYTE-IDENTICAL venv: use the exact-version freeze instead —
+    #  uv pip install --python $V --no-deps -r requirements/runtime_pascal_freeze.txt
+    #  torch + the vLLM wheel come from the local wheels in Step 0/1, not PyPI)
     # 4. torchvision is REQUIRED for the Qwen VL model files: the registry
     #    inspects the arch in a subprocess that imports
     #    image_processing_qwen2_vl -> torchvision.transforms at module import.
