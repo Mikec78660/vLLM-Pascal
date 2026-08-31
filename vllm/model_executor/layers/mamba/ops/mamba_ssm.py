@@ -632,7 +632,7 @@ def selective_state_update(
         else None
     )
 
-    with torch.accelerator.device_index(x.device.index):
+    with torch.cuda.device(x.device.index):
         _selective_scan_update_kernel[grid](
             state,
             rand_seed,
