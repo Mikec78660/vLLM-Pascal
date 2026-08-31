@@ -50,7 +50,7 @@ LXC container on a Proxmox host:
 | GPUs | **5× Tesla P40** (24 GB GDDR5, ~196 GB/s, CC 6.1, idx 0–4) + **2× Tesla P100-PCIE** (16 GB HBM2, ~732 GB/s, CC 6.0, idx 5,6) |
 | PCIe | **Gen1 (2.5 GT/s)**. Slots are x16 but negotiate **x1** in this chassis → ~250 MB/s per GPU. Model loads are PCIe-bound (a 13 GB dequantized 9B takes ~52 s); TP collectives run over shared memory (NCCL SHM transport, P2P enabled between the P40s), and decode is GPU-bandwidth-bound, so the x1 link does **not** limit tok/s — only load time. |
 | GPU topology | All 7 cards share one PCIe switch (PIX), single NUMA node |
-| Driver / runtime | NVIDIA 550.127.05, Python 3.13.5, uv-managed venv. **No CUDA toolkit on the runtime host** — Triton 3.6.0 ships its own `ptxas`, torch is a source-built cu124 wheel. |
+| Driver / runtime | NVIDIA driver 550.x (host passthrough), Python 3.13, uv venv, **Debian `nvidia-cuda-toolkit` 12.4** for the cu12 runtime libs. No `/usr/local/cuda`, no `nvcc` — Triton 3.6.0 ships its own `ptxas`; the source-built torch cu124 wheel resolves the **system** cu12 libs via its RUNPATH. |
 
 ## Models tested
 
@@ -298,8 +298,8 @@ python setup.py bdist_wheel
 ### Step 1 — build the vLLM-Pascal wheel
 
 ```bash
-git clone https://github.com/Mikec78660/vLLM-Pascal /opt/1Cat-vLLM
-cd /opt/1Cat-vLLM   # default branch: pascal (the working code)
+git clone -b pascal-dev https://github.com/Mikec78660/vLLM-Pascal /opt/1Cat-vLLM
+cd /opt/1Cat-vLLM   # branch pascal-dev: the working, consolidated code
 uv venv --python 3.13 /opt/vllm-build-env
 uv pip install --python /opt/vllm-build-env/bin/python \
     cmake ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" \
@@ -318,7 +318,11 @@ export CMAKE_BUILD_TYPE=Release
 MAX_JOBS=8 NVCC_THREADS=1 \
 /opt/vllm-build-env/bin/python setup.py bdist_wheel
 # OOM (27 GB box): on code=137 halve MAX_JOBS (floor 2), NVCC_THREADS=1.
-# → dist/1cat_vllm-<git-describe>.cu124-cp313-cp313-linux_x86_64.whl
+# → dist/1cat_vllm-1.3.1.dev0+cu124-cp313-cp313-linux_x86_64.whl
+# (the version is pinned to a stable `1.3.1.dev0` in setup.py — every rebuild of
+#  this branch yields the SAME wheel name; provenance is the git commit, not
+#  the version. Verify it is Pascal-only: cuobjdump the .so, expect sm_60/sm_61
+#  only, zero sm_70/sm_52.)
 ```
 
 Key compile facts: `setup.py` imports torch at module top ⇒ `--no-build-isolation`
@@ -327,49 +331,75 @@ unconditional SM70 bundle steps; CMake's `CUDA_SUPPORTED_ARCHS` is patched in
 **two** if-branches (CUDA-12 path + fallback); the wheel embeds only sm_60/61
 (verify: `python -c "import vllm._C"` + `strings vllm/_C.abi3.so | grep -c sm_7` → 0).
 
-### Step 2 — deploy on the GPU host (no CUDA toolkit needed)
+### Step 2 — deploy on the GPU host
 
-```bash
-# runtime host: driver 550.x, python3.13, uv. Triton 3.6.0 is self-contained
-# (bundles ptxas + libtriton; NEEDED = libz/libtinfo/libm/libc only).
-uv venv --python 3.13 /opt/1Cat-vLLM/venv
-uv pip install --python /opt/1Cat-vLLM/venv/bin/python --no-deps \
-    /path/to/1cat_vllm-<git-describe>.cu124-cp313-cp313-linux_x86_64.whl
-uv pip install --python /opt/1Cat-vLLM/venv/bin/python --no-deps \
-    /path/to/torch-2.10.0-cp313-*.whl
-# torch's nvidia-* runtime pins: parse the torch wheel's METADATA
-# Requires-Dist and install those exact versions (12.4 series:
-# cufft 11.2.3.61, curand 10.3.4.107, cusolver 11.5.3.52, cusparse 12.3.1.170,
-# cublas/cudnn/cupti/nvjitlink 12.4.x) + triton==3.6.0 + the remaining
-# runtime deps (all py3-none or cp313 wheels — no compilation).
-# torchvision is REQUIRED for the Qwen3.5/3.8 VL model files: the model
-# registry inspects the arch in a subprocess that imports
-# image_processing_qwen2_vl -> torchvision.transforms at module import.
-# Missing it dies at boot ("Error in inspecting model architecture").
-# ALWAYS --no-deps: a bare install lets the resolver upgrade torch to the
-# PyPI version and clobbers the hand-built Pascal wheels.
-uv pip install --python /opt/1Cat-vLLM/venv/bin/python --no-deps \
-    torchvision==0.25.0
-echo "/opt/1Cat-vLLM/venv/lib/python3.13/site-packages/nvidia/*/lib" \
-    > /etc/ld.so.conf.d/1cat-vllm.conf && ldconfig
-# smoke test (verified against the dev5 wheel):
-/opt/1Cat-vLLM/venv/bin/python -c "
-import torch, vllm
-from vllm.benchmarks.lib.utils import default_vllm_config
-from vllm.platforms import current_platform
-from vllm.v1.attention.selector import AttentionSelectorConfig
-from vllm.v1.attention.backend import AttentionType
-print(vllm.__version__, torch.version.cuda,
-      current_platform.get_device_capability())
-with default_vllm_config():
-    cfg = AttentionSelectorConfig(head_size=128, dtype=torch.float16,
-        kv_cache_dtype='float16', block_size=16, use_mla=False, has_sink=False,
-        use_sparse=False, use_mm_prefix=False, use_per_head_quant_scales=False,
-        attn_type=AttentionType.DECODER, use_non_causal=False,
-        use_batch_invariant=False, use_kv_connector=False)
-    print(current_platform.get_attn_backend_cls(None, cfg, num_heads=24))
-"   # expect TRITON_ATTN on Pascal
-```
+A fresh LXC needs **two things it won't have by default**: the NVIDIA
+**driver** (550.x — free with the GPU passthrough) and the **CUDA 12.4
+runtime libs**. The runtime libs are the catch. The source-built torch wheel
+bundles **no** nvidia `.so` and its METADATA declares **no** nvidia deps —
+`libtorch_cuda.so` has `RUNPATH $ORIGIN:/usr/local/cuda/lib64` plus
+`NEEDED libcublas.so.12` / `libcufft.so.11` / `libcurand.so.10` /
+`libcusparse.so.12` / `libnvJitLink.so.12`, so it resolves those from the
+**system** ld path. On llama.lan that is the Debian `nvidia-cuda-toolkit
+12.4` package. Install the matching runtime libs on any fresh LXC (driver
+550.x caps at CUDA 12.4, so use the 12.4 series):
+
+    apt-get install -y nvidia-cuda-toolkit   # 12.4: libcublas12 libcublaslt12 \
+                                             # libcufft11 libcurand10 \
+                                             # libcusparse12 libcusolver11 \
+                                             # libnvjitlink12
+    # verify torch can resolve them — every line must resolve, none "not found":
+    ldd /opt/1Cat-vLLM/venv/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so \
+      | grep -E 'libcublas.so.12|libcufft.so.11|libcurand.so.10|libcusparse.so.12|libnvJitLink.so.12'
+
+No `nvcc` / `/usr/local/cuda` is needed at runtime: Triton 3.6.0 ships its
+own `ptxas` and the wheel is prebuilt.
+
+Then build the venv. **Everything is `--no-deps`** — a bare install lets the
+resolver pull the PyPI cu128 torch build and clobbers the hand-built Pascal
+wheel:
+
+    uv venv --python 3.13 /opt/1Cat-vLLM/venv
+    V=/opt/1Cat-vLLM/venv/bin/python
+    # 1. the vLLM-Pascal wheel you built in Step 1:
+    uv pip install --python $V --no-deps \
+        /path/to/1cat_vllm-1.3.1.dev0+cu124-cp313-cp313-linux_x86_64.whl
+    # 2. the source-built torch wheel from Step 0:
+    uv pip install --python $V --no-deps \
+        /path/to/torch-2.10.0-cp313-cp313-linux_x86_64.whl
+    # 3. the curated runtime deps — committed in this repo (the exact set the
+    #    known-good venv was built from; all py3-none/cp313 wheels, no compile):
+    uv pip install --python $V --no-deps -r requirements/runtime_pascal.txt
+    # 4. torchvision is REQUIRED for the Qwen VL model files: the registry
+    #    inspects the arch in a subprocess that imports
+    #    image_processing_qwen2_vl -> torchvision.transforms at module import.
+    #    Missing it dies at boot ("Error in inspecting model architecture"):
+    uv pip install --python $V --no-deps torchvision==0.25.0
+
+Do **not** add an `ld.so.conf.d` entry pointing at the venv's `nvidia/*/lib`.
+torch uses the **system** cu12 libs (above), not the cu13 `nvidia-*` pip
+packages that the runtime deps pull in transitively (humming-kernels,
+flashinfer, quack-kernels, tilelang). Those cu13 packages are present but are
+not the active cuBLAS/cuDNN path — a conf pointing at them is dead weight.
+
+    # smoke test (verified against the dev0/dev5 wheels):
+    /opt/1Cat-vLLM/venv/bin/python -c "
+    import torch, vllm
+    from vllm.benchmarks.lib.utils import default_vllm_config
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm.v1.attention.backend import AttentionType
+    print(vllm.__version__, torch.version.cuda,
+          current_platform.get_device_capability())
+    with default_vllm_config():
+        cfg = AttentionSelectorConfig(head_size=128, dtype=torch.float16,
+            kv_cache_dtype='float16', block_size=16, use_mla=False, has_sink=False,
+            use_sparse=False, use_mm_prefix=False, use_per_head_quant_scales=False,
+            attn_type=AttentionType.DECODER, use_non_causal=False,
+            use_batch_invariant=False, use_kv_connector=False)
+        print(current_platform.get_attn_backend_cls(None, cfg, num_heads=24))
+    "   # expect TRITON_ATTN on Pascal
+
 
 ### Step 3 — serve (canonical launch)
 
@@ -377,8 +407,11 @@ with default_vllm_config():
 # CUDA_DEVICE_ORDER=PCI_BUS_ID is REQUIRED on this LXC: the default CUDA device
 # ordering is NOT PCI-bus order, so without it CUDA_VISIBLE_DEVICES=0,1 selects
 # the wrong physical GPUs.
-# TRITON_CACHE_DIR pins the JIT cache (the box keeps it at /root/.triton-cache);
-# a warm cache makes a reboot start in ~40 s instead of a 5-15 min JIT storm.
+# TRITON_CACHE_DIR pins the JIT cache. It is LOCAL — a fresh LXC starts
+# cold (first boot ~5-15 min of Triton JIT + CUDA-graph capture) and is fast
+# after that. Pin it to a durable path (not /tmp): /root/.triton-cache. The
+# benchmark numbers in this doc are steady-state, so they hold cold or warm.
+
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 CUDA_VISIBLE_DEVICES=0,1 \
 TRITON_CACHE_DIR=/root/.triton-cache \
@@ -426,7 +459,8 @@ Launchers for the tested configs live in `benchmarks/pascal/`
 
 | branch | state |
 |---|---|
-| `pascal` | **canonical**: the working prod code — pre-upstream-merge Pascal fork + the 12 hand-tuned kernel files + 5 custom GEMV kernels (committed `.so`) + vendored `triton_kernels` + fp8→int8 KV alias. This is exactly what runs 16.67 t/s in prod. |
+| `pascal-dev` | **build/deploy branch** — the consolidated working code (pre-upstream-merge Pascal fork + 12 hand-tuned kernel files + 5 custom GEMV kernels as committed `.so` + vendored `triton_kernels` + fp8→int8 KV alias + the CMake arch-whitelist / W8A8-fallback fixes). Clone **this** to build. This is what runs in prod. |
+| `pascal` | **frozen** at f9d2ec4ba — the pre-consolidation prod tree, kept for reference only. Do not build from it. |
 
 The experimental v1.3.0 upstream merge (which added the Exllama-v2 kernel set and
 399 SM70 files) is **not** in this branch. Its tip is preserved as tag

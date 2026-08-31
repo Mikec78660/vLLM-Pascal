@@ -1125,6 +1125,13 @@ def _cuda_arch_contains(major: int, minor: int = 0) -> bool:
 
 
 def get_vllm_version() -> str:
+    # vLLM-Pascal (pascal-dev): pin a STABLE dev version so every rebuild of
+    # this branch yields the SAME wheel name (1.3.1.dev0+cu124) -- no dev2/dev5/
+    # dev7 drift that makes builds indistinguishable. Exact provenance (the git
+    # commit) is recorded in README / BUILD-NOTES-pascal.md, not the version.
+    # An explicit VLLM_VERSION_OVERRIDE still wins (it overrides below).
+    os.environ.setdefault("SETUPTOOLS_SCM_PRETEND_VERSION", "1.3.1.dev0")
+
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
