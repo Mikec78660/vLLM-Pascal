@@ -80,6 +80,8 @@ msgspec==0.21.1
 multidict==6.7.1
 networkx==3.6.1
 ninja==1.13.0
+nixl==1.4.0
+nixl_cu12==1.4.0
 numba==0.65.0
 numpy==2.4.6
 nvidia_cublas==13.1.1.3

@@ -419,8 +419,25 @@ def has_deep_gemm() -> bool:
 
 
 def has_nixl_ep() -> bool:
-    """Whether the optional `nixl_ep` package is available."""
-    return _has_module("nixl_ep")
+    """Whether the optional `nixl_ep` package is available.
+
+    A shallow ``find_spec`` (as in :func:`_has_module`) is NOT sufficient
+    here. The ``nixl_ep`` meta-dispatcher imports a torch-ABI-specific C
+    extension (``nixl_ep_cpp_torchXX``) at ``__init__`` time, and the
+    ``nixl``/``nixl-cu12`` wheel only ships builds for a subset of torch
+    versions. If the installed torch has no matching build, the package
+    directory exists (so ``find_spec`` reports it present) but the import
+    raises ``ModuleNotFoundError``. Require the real import to succeed so
+    callers (e.g. the MoE all2all prepare/finalize selection) can gate on
+    a genuinely usable ``nixl_ep``.
+    """
+    if not _has_module("nixl_ep"):
+        return False
+    try:
+        importlib.import_module("nixl_ep")
+    except Exception:  # noqa: BLE001 - any import failure = not available
+        return False
+    return True
 
 
 def has_triton_kernels() -> bool:

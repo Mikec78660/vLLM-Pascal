@@ -384,6 +384,16 @@ wheel:
     #    image_processing_qwen2_vl -> torchvision.transforms at module import.
     #    Missing it dies at boot ("Error in inspecting model architecture"):
     uv pip install --python $V --no-deps torchvision==0.25.0
+    # 5. (optional) NIXL KV-cache-transfer connector — needed only if you run
+    #    disaggregated prefill/decode with `--kv-transfer-config` NixlConnector.
+    #    Install `nixl` (the connector backend) + the cu12 backend. Do NOT use
+    #    the bare `nixl` meta alone: it hard-depends on BOTH nixl-cu12 and
+    #    nixl-cu13, dragging a second cu13 torch + the whole cu13 nvidia stack
+    #    (~1.5 GB of dead weight on a 550.x-driver / cu12.4 Pascal box). With --no-deps
+    #    the resolver is bypassed, so install only the two cu12 pieces. The
+    #    backend auto-selects nixl_cu12 (torch 12.4); NIXL bundles its own UCX
+    #    (no separate ucx-py needed).
+    uv pip install --python $V --no-deps nixl==1.4.0 nixl-cu12==1.4.0
 
 Add **exactly one** `ld.so.conf.d` entry — for cufile, and only cufile.
 torch 2.10 also `NEEDED`s `libcufile.so.0` (GPUDirect Storage), which the
