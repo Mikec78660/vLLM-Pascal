@@ -7,6 +7,8 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include "moe_wna16_utils.h"
+#include "../libtorch_stable/quantization/gptq/compat.cuh"
+using namespace vllm::gptq;  // half atomicAdd CAS shim (CC < 7.x)
 
 #define DIVIDE(x, size) (((x) + (size) - 1) / (size))
 

@@ -110,9 +110,9 @@ elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
   # Keep SM70 available for the isolated V100 TurboMind backend. CUDA 12.8
   # still supports offline SM70 compilation, while CUDA 13 warns that pre-7.5
   # offline support is removed.
-  set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
+  set(CUDA_SUPPORTED_ARCHS "6.0;6.1;7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
 else()
-  set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.7;8.9;9.0")
+  set(CUDA_SUPPORTED_ARCHS "6.0;6.1;7.0;7.5;8.0;8.6;8.7;8.9;9.0")
 endif()
 
 #
