@@ -1,3 +1,9 @@
+# NOTE 2026-08-31: this file records the dev5-era upgrade (1.3.1.dev5+gf89434d9f).
+# That wheel file and the /opt/1Cat-vLLM path no longer exist: the version is now the
+# stable 1.3.1.dev0 (pascal-dev HEAD) and the runtime lives at /mnt/AI/1Cat-vLLM.
+# The dev0 code is byte-identical to dev5 (git diff f89434d9f..978c95a4b -- vllm/ is empty),
+# so every number in this file applies to the current runtime.
+
 # vLLM-Pascal wheel rebuild log (2026-08-31, from clean clone)
 
 Branch: `pascal-dev` on github.com/Mikec78660/vLLM-Pascal.
