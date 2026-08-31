@@ -46,11 +46,12 @@ LXC container on a Proxmox host:
 | | |
 |---|---|
 | CPU | AMD EPYC 3151 — 4 cores / 8 threads, 1.2–2.7 GHz, 16 MiB L3 |
+| Disk | **28 GB root FS** (too small for the 8 GB venv) + **1 TB data disk** at `/mnt/AI` → the runtime lives at **`/mnt/AI/1Cat-vLLM`** (one path, no aliases, no second copies) |
 | RAM | 24 GiB (LXC cgroup), + 8 GiB swap; 16 GiB tmpfs `/tmp` for venv/caches |
 | GPUs | **5× Tesla P40** (24 GB GDDR5, ~196 GB/s, CC 6.1, idx 0–4) + **2× Tesla P100-PCIE** (16 GB HBM2, ~732 GB/s, CC 6.0, idx 5,6) |
 | PCIe | **Gen1 (2.5 GT/s)**. Slots are x16 but negotiate **x1** in this chassis → ~250 MB/s per GPU. Model loads are PCIe-bound (a 13 GB dequantized 9B takes ~52 s); TP collectives run over shared memory (NCCL SHM transport, P2P enabled between the P40s), and decode is GPU-bandwidth-bound, so the x1 link does **not** limit tok/s — only load time. |
 | GPU topology | All 7 cards share one PCIe switch (PIX), single NUMA node |
-| Driver / runtime | NVIDIA driver 550.x (host passthrough), Python 3.13, uv venv, **Debian `nvidia-cuda-toolkit` 12.4** for the cu12 runtime libs. No `/usr/local/cuda`, no `nvcc` — Triton 3.6.0 ships its own `ptxas`; the source-built torch cu124 wheel resolves the **system** cu12 libs via its RUNPATH. |
+| Driver / runtime | NVIDIA driver 550.x (host passthrough), Python 3.13, uv venv, **Debian `nvidia-cuda-toolkit` 12.4** for the cu12 runtime libs, + **one** `ld.so.conf.d` entry exposing the venv's pip `nvidia_cufile` (torch NEEDs `libcufile.so.0`; the toolkit doesn't ship it). No `/usr/local/cuda`, no `nvcc` — Triton 3.6.0 ships its own `ptxas`; the source-built torch cu124 wheel resolves the **system** cu12 libs via its RUNPATH. |
 
 ## Models tested
 
@@ -298,8 +299,13 @@ python setup.py bdist_wheel
 ### Step 1 — build the vLLM-Pascal wheel
 
 ```bash
-git clone -b pascal-dev https://github.com/Mikec78660/vLLM-Pascal /opt/1Cat-vLLM
-cd /opt/1Cat-vLLM   # branch pascal-dev: the working, consolidated code
+# ONE canonical runtime path. On llama.lan it MUST be /mnt/AI/1Cat-vLLM:
+# the root FS is 28 GB (venv is 8 GB) and /mnt/AI is the 1 TB data disk.
+# A fresh LXC with a normal root disk may use /opt/1Cat-vLLM instead.
+# Pick ONE and never create a second copy or alias of it.
+export RT=/mnt/AI/1Cat-vLLM
+git clone -b pascal-dev https://github.com/Mikec78660/vLLM-Pascal $RT
+cd $RT   # branch pascal-dev: the working, consolidated code
 uv venv --python 3.13 /opt/vllm-build-env
 uv pip install --python /opt/vllm-build-env/bin/python \
     cmake ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" \
@@ -349,7 +355,7 @@ bundles **no** nvidia `.so` and its METADATA declares **no** nvidia deps —
                                              # libcusparse12 libcusolver11 \
                                              # libnvjitlink12
     # verify torch can resolve them — every line must resolve, none "not found":
-    ldd /opt/1Cat-vLLM/venv/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so \
+    ldd $RT/venv/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so \
       | grep -E 'libcublas.so.12|libcufft.so.11|libcurand.so.10|libcusparse.so.12|libnvJitLink.so.12'
 
 No `nvcc` / `/usr/local/cuda` is needed at runtime: Triton 3.6.0 ships its
@@ -359,8 +365,8 @@ Then build the venv. **Everything is `--no-deps`** — a bare install lets the
 resolver pull the PyPI cu128 torch build and clobbers the hand-built Pascal
 wheel:
 
-    uv venv --python 3.13 /opt/1Cat-vLLM/venv
-    V=/opt/1Cat-vLLM/venv/bin/python
+    uv venv --python 3.13 $RT/venv
+    V=$RT/venv/bin/python
     # 1. the vLLM-Pascal wheel you built in Step 1:
     uv pip install --python $V --no-deps \
         /path/to/1cat_vllm-1.3.1.dev0+cu124-cp313-cp313-linux_x86_64.whl
@@ -379,14 +385,25 @@ wheel:
     #    Missing it dies at boot ("Error in inspecting model architecture"):
     uv pip install --python $V --no-deps torchvision==0.25.0
 
-Do **not** add an `ld.so.conf.d` entry pointing at the venv's `nvidia/*/lib`.
-torch uses the **system** cu12 libs (above), not the cu13 `nvidia-*` pip
-packages that the runtime deps pull in transitively (humming-kernels,
-flashinfer, quack-kernels, tilelang). Those cu13 packages are present but are
-not the active cuBLAS/cuDNN path — a conf pointing at them is dead weight.
+Add **exactly one** `ld.so.conf.d` entry — for cufile, and only cufile.
+torch 2.10 also `NEEDED`s `libcufile.so.0` (GPUDirect Storage), which the
+Debian CUDA 12.4 toolkit does **not** ship; it comes from the venv's pip
+`nvidia_cufile` package. Without this one entry `import torch` fails with
+`ImportError: libcufile.so.0: cannot open shared object file`:
+
+    printf '%s/venv/lib/python3.13/site-packages/nvidia/cufile/lib\n' $RT \
+        > /etc/ld.so.conf.d/1cat-vllm-cufile.conf
+    ldconfig
+
+Do **not** add entries for the venv's other `nvidia/*/lib` dirs. torch uses
+the **system** cu12 libs (above), not the cu13 `nvidia-*` pip packages that
+the runtime deps pull in transitively (humming-kernels, flashinfer,
+quack-kernels, tilelang). Those cu13 packages are present but are not the
+active cuBLAS/cuDNN path — confs pointing at them are dead weight. The live
+llama.lan runtime has exactly the one cufile conf and nothing else.
 
     # smoke test (verified against the dev0/dev5 wheels):
-    /opt/1Cat-vLLM/venv/bin/python -c "
+    $RT/venv/bin/python -c "
     import torch, vllm
     from vllm.benchmarks.lib.utils import default_vllm_config
     from vllm.platforms import current_platform
@@ -418,7 +435,7 @@ not the active cuBLAS/cuDNN path — a conf pointing at them is dead weight.
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 CUDA_VISIBLE_DEVICES=0,1 \
 TRITON_CACHE_DIR=/root/.triton-cache \
-/opt/1Cat-vLLM/venv/bin/vllm serve /AI/models/Qwen3.8-27B-INT8-W8A16-MTP \
+$RT/venv/bin/vllm serve /AI/models/Qwen3.8-27B-INT8-W8A16-MTP \
   --served-model-name qwen3.8-27b-int8 \
   --quantization compressed-tensors \
   --tensor-parallel-size 2 \
