@@ -643,6 +643,35 @@ def choose_mp_linear_kernel(
 
     platform_kernels = _POSSIBLE_KERNELS[current_platform._enum]
 
+    # [PASCAL] int4 (WNA16) GEMV kernel priority on CC < 70.
+    # On Pascal (P100=6.0 / P40=6.1) the Marlin int4 kernels are
+    # capability-blocked (need SM70), leaving only Exllama and
+    # TritonW4A16. Exllama is listed first in _POSSIBLE_KERNELS, so the
+    # auto-select picks it whenever its can_implement passes — which it
+    # does for actorder:static checkpoints (e.g. RedHatAI *INT4), giving a
+    # GEMV that is ~2x SLOWER on CC6.x than TritonW4A16. (actorder:group
+    # checkpoints like AWQ already fall through to TritonW4A16, since
+    # Exllama rejects g_idx.) See w4a16-kernel-dispatch-pascal.md.
+    # => On CUDA Pascal, when no explicit --linear-backend is requested,
+    # reorder TritonW4A16 ahead of Exllama so the fast kernel wins by
+    # default. No-op on SM70+ (Marlin handles int4 there), on ROCm, and
+    # whenever the user sets --linear-backend explicitly.
+    if (
+        current_platform._enum == PlatformEnum.CUDA
+        and compute_capability is not None
+        and compute_capability < 70
+        and _get_linear_backend() == "auto"
+        and TritonW4A16LinearKernel in platform_kernels
+        and ExllamaLinearKernel in platform_kernels
+    ):
+        platform_kernels = [
+            k
+            for k in platform_kernels
+            if k is not TritonW4A16LinearKernel
+        ]
+        triton_insert_at = platform_kernels.index(ExllamaLinearKernel)
+        platform_kernels.insert(triton_insert_at, TritonW4A16LinearKernel)
+
     # Apply --linear-backend filtering when set.
     linear_backend = _get_linear_backend()
     if linear_backend != "auto":
