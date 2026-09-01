@@ -507,7 +507,13 @@ class TritonW4A16LinearKernel(MPLinearKernel):
         # `zero = ZP_BIAS`) so the fast GEMV fires for symmetric checkpoints.
         # Asymmetric checkpoints already have w_zp and are left untouched.
         if w_zp is None and c.weight_type.has_bias():
-            packed = int(c.weight_type.bias) * 0x11111111  # 0x88888888 for uint4b8
+            # 8 nibbles of `bias` packed into one int32 (0x88888888 for uint4b8).
+            # Reinterpret the 4 bytes as SIGNED int32 so torch.full() does not
+            # overflow (0x88888888 = 2303823816 > INT32_MAX; signed = -2004318072,
+            # same memory bits). The kernel reads a signed int and masks &0xF, so
+            # sign-extension never corrupts the extracted nibble (all are `bias`).
+            packed = int(c.weight_type.bias) * 0x11111111
+            packed = int.from_bytes(packed.to_bytes(4, "little"), "little", signed=True)
             nz, ng = w_q.shape[0] // group_size, w_q.shape[1]
             w_zp = torch.full((nz, ng), packed, dtype=torch.int32, device=w_q.device)
 
