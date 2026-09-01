@@ -322,6 +322,12 @@ export TORCH_CUDA_ARCH_LIST="6.0;6.1"      # P100 + P40 — the whole point
 export VLLM_SKIP_SM70_BUNDLES=1            # don't build SM70-only bundles
 export VLLM_REQUIRE_RUST_FRONTEND=0
 export CMAKE_BUILD_TYPE=Release
+# PITFALL (2026-09-01): cmake version. `setup.py` calls cmake via PATH; this box's
+# /usr/bin/cmake is 3.25.1 but CMakeLists requires >= 3.26 (bumped in the upstream
+# consolidation) -> fails at configure with "CMake 3.26 or higher is required".
+# The venv ships 4.4.3 at /opt/vllm-build-env/bin/cmake — prepend the venv bin to
+# PATH so the build picks THAT one, or the build dies before compiling a single TU:
+export PATH=/opt/vllm-build-env/bin:$PATH
 MAX_JOBS=8 NVCC_THREADS=1 \
 /opt/vllm-build-env/bin/python setup.py bdist_wheel
 # OOM (27 GB box): on code=137 halve MAX_JOBS (floor 2), NVCC_THREADS=1.
