@@ -255,7 +255,7 @@ def triton_w4a16_gemm(
     _conds = {
         "loaded": _W4A16_GEMV is not None,
         "fp16": a.dtype == torch.float16,
-        "has_zp": qzeros is not None,
+        "has_zp": qzeros is not None,  # [PASCAL] synthetic for symmetric uint4b8 (see apply_weights)
         "smallM": M <= 4,
         "gs": group_size > 0,
         "kgd": K % group_size == 0 if group_size > 0 else False,
@@ -494,8 +494,22 @@ class TritonW4A16LinearKernel(MPLinearKernel):
         K = c.partition_weight_shape[0]
         group_size = c.group_size if c.group_size != -1 else K
 
-        # For symmetric types (uint4b8), use the scalar bias; no zeros tensor
         zp_bias = c.weight_type.bias if c.weight_type.has_bias() else 0
+
+        # [PASCAL] The fast CUDA split-K GEMV (w4a16_gemv.so) is gated on
+        # `qzeros is not None` (see triton_w4a16_gemm). Symmetric compressed-
+        # tensors int4 checkpoints (RedHatAI `*-INT4`: symmetric=True, no
+        # weight_zero_point) never carry a zero-point tensor, so they used to
+        # fall through to the slow Triton tl.dot GEMM (~2x slower decode on
+        # Pascal) even though the GEMV kernel itself fully supports the
+        # constant-bias (uint4b8, bias=8) case. Synthesize the packed constant
+        # zero tensor here (identical dequant to the Triton path's
+        # `zero = ZP_BIAS`) so the fast GEMV fires for symmetric checkpoints.
+        # Asymmetric checkpoints already have w_zp and are left untouched.
+        if w_zp is None and c.weight_type.has_bias():
+            packed = int(c.weight_type.bias) * 0x11111111  # 0x88888888 for uint4b8
+            nz, ng = w_q.shape[0] // group_size, w_q.shape[1]
+            w_zp = torch.full((nz, ng), packed, dtype=torch.int32, device=w_q.device)
 
         output = triton_w4a16_gemm(
             a=x_2d,
