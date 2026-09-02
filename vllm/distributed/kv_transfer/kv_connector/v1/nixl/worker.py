@@ -785,6 +785,62 @@ class NixlConnectorWorker:
         # Forwarding a real layer name rather than a synthetic key
         self.register_kv_caches({first_layer: kv_cache})
 
+    def _nixl_exclude_draft_attn(self) -> set[str]:
+        """Attention-layer names belonging to a speculative (MTP/draft) model
+        that must NOT be registered as NIXL transfer regions.
+
+        The MTP draft model contributes full-attention layers (e.g.
+        ``mtp.layers.0.self_attn.attn``) that live outside the target model. They
+        are decode-local (the drafter runs on the decode engine with its own KV
+        and is never produced by the prefill engine). Registering them as regions
+        (a) breaks the P<->D region-count handshake and (b) shifts the FA/SSM
+        descriptor layout so the Mamba state never transfers and the decode side
+        emits deterministic garbage. We therefore exclude any attention layer
+        whose name does NOT share the dominant layer namespace: the target model
+        registers the overwhelming majority of attention layers under one prefix
+        (e.g. ``language_model.model.layers.<i>``), while MTP draft layers sit
+        under a different one (``mtp.layers.<i>``).
+        """
+        if getattr(self.vllm_config, "speculative_config", None) is None:
+            return set()
+        ctx = self.vllm_config.compilation_config.static_forward_context
+        if not ctx:
+            return set()
+        try:
+            from vllm.model_executor.layers.attention_layer_base import (
+                AttentionLayerBase,
+            )
+        except Exception:
+            return set()
+        attn_names = [n for n, l in ctx.items() if isinstance(l, AttentionLayerBase)]
+        if not attn_names:
+            return set()
+        # Dominant namespace = the longest common prefix shared by the majority
+        # of attention layers (the target model). Any attention layer that does
+        # not start with it is a draft/MTP layer.
+        from collections import Counter
+
+        firstseg = Counter(n.split(".", 1)[0] for n in attn_names)
+        top = firstseg.most_common(1)[0][0]
+        top_layers = [n for n in attn_names if n.split(".", 1)[0] == top]
+        common = os.path.commonprefix(top_layers)
+        idx = common.find(".layers")
+        target_prefix = common[: idx] if idx > 0 else common
+        exclude = {n for n in attn_names if not n.startswith(target_prefix)}
+        # Safety: if this would drop more than half the attention layers we are
+        # almost certainly mis-detecting (no real draft model) -> exclude nothing.
+        if len(exclude) > len(attn_names) // 2:
+            return set()
+        if exclude:
+            logger.info(
+                "NIXL: excluding %d speculative (MTP/draft) attention layer(s) "
+                "from KV transfer (target_prefix=%r): %s",
+                len(exclude),
+                target_prefix,
+                sorted(exclude),
+            )
+        return exclude
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
         self.transfer_topo = TransferTopology(
@@ -817,6 +873,20 @@ class NixlConnectorWorker:
             assert not self.host_xfer_buffers, (
                 "host_xfer_buffer should not be initialized when "
                 f"kv_buffer_device is {self.kv_buffer_device}"
+            )
+
+        # Exclude MTP/draft attention layers from NIXL registration. The drafter
+        # is decode-local (never produced by the prefill engine), so its KV must
+        # not be a transfer region: registering it breaks the P<->D region-count
+        # handshake and shifts the FA/SSM descriptor layout, so the Mamba state
+        # never transfers and the decode side emits deterministic garbage.
+        _draft_attn = self._nixl_exclude_draft_attn()
+        if _draft_attn:
+            xfer_buffers = {k: v for k, v in xfer_buffers.items()
+                            if k not in _draft_attn}
+            logger.info(
+                "NIXL: excluded %d speculative (MTP/draft) attention layer(s) "
+                "from KV transfer: %s", len(_draft_attn), sorted(_draft_attn),
             )
 
         logger.info(
