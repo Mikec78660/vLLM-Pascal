@@ -162,6 +162,39 @@ class CustomAllreduce:
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
         tp8_hierarchical = False
         hierarchical_peer_ranks: tuple[int, ...] | None = None
+        # [PASCAL] `is_fully_connected()` above only detects NVLink. PCIe groups
+        # that are wired through a PCIe switch with P2P enabled (e.g. the 4x
+        # P40 on vLLM.lan) therefore report not-fully-connected and are
+        # conservatively disabled even though the P2P-backed multi-GPU kernels
+        # run correctly. When the opt-in override is set, verify that the group
+        # is genuinely P2P-capable and, if so, treat it as fully connected so
+        # the existing 1stage/2stage reduce-scatter/allgather kernels dispatch.
+        pcie_fully_connected = False
+        if (
+            world_size > 2
+            and not fully_connected
+            and current_platform.is_cuda_alike()
+            and not current_platform.is_rocm()
+            and envs.VLLM_P2P_OVERRIDE_FULLY_CONNECTED
+        ):
+            if _can_p2p(rank, world_size):
+                fully_connected = True
+                pcie_fully_connected = True
+                logger.info(
+                    "[PASCAL] Custom allreduce enabled for a non-NVLink PCIe "
+                    "group of %d GPUs: all P2P edges verified, treating the "
+                    "group as fully connected (VLLM_P2P_OVERRIDE_FULLY_CONNECTED=1)."
+                    " Dispatch uses the existing multi-GPU allreduce kernels.",
+                    world_size,
+                )
+            else:
+                logger.warning(
+                    "[PASCAL] VLLM_P2P_OVERRIDE_FULLY_CONNECTED=1 was set but "
+                    "the group is not fully P2P-capable (P2P check failed); "
+                    "leaving custom allreduce disabled."
+                )
+                self.disabled = True
+                return
         if world_size > 2 and not fully_connected:
             sm70_tp8_candidate = (
                 envs.VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR
@@ -211,6 +244,7 @@ class CustomAllreduce:
         # On AMD GPU, p2p is always enabled between XGMI connected GPUs
         if (
             not tp8_hierarchical
+            and not pcie_fully_connected
             and not current_platform.is_rocm()
             and not _can_p2p(rank, world_size)
         ):
