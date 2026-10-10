@@ -316,7 +316,7 @@ class Fp8Config(QuantizationConfig):
             else:
                 offline_method = Fp8LinearMethod(self)
                 offline_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
-                if _is_pascal_q80_enabled() and self.block_quant:
+                if _is_pascal_q80_enabled() and self.weight_block_size is not None:
                     offline_method = Q80LinearMethod(self)
                 return offline_method
         elif isinstance(layer, RoutedExperts):
