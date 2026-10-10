@@ -163,38 +163,68 @@ class CustomAllreduce:
         tp8_hierarchical = False
         hierarchical_peer_ranks: tuple[int, ...] | None = None
         # [PASCAL] `is_fully_connected()` above only detects NVLink. PCIe groups
-        # that are wired through a PCIe switch with P2P enabled (e.g. the 4x
-        # P40 on vLLM.lan) therefore report not-fully-connected and are
-        # conservatively disabled even though the P2P-backed multi-GPU kernels
-        # run correctly. When the opt-in override is set, verify that the group
-        # is genuinely P2P-capable and, if so, treat it as fully connected so
-        # the existing 1stage/2stage reduce-scatter/allgather kernels dispatch.
+        # wired through a PCIe switch with P2P enabled (e.g. the 4x P40 on
+        # vLLM.lan) therefore report not-fully-connected and are conservatively
+        # disabled with the "more than two PCIe-only GPUs" warning, even though
+        # the P2P-backed multi-GPU allreduce kernels are correct for them.
+        # Default-ON override (fork pattern; disable with
+        # VLLM_DISABLE_P2P_FULLY_CONNECTED_OVERRIDE=1): run a COMPLETE directed
+        # all-pairs P2P check. If every edge genuinely supports P2P, treat the
+        # group as fully connected so the existing 1stage/2stage kernels
+        # dispatch; otherwise fall back to the legacy behavior (disabled).
         pcie_fully_connected = False
         if (
             world_size > 2
             and not fully_connected
             and current_platform.is_cuda_alike()
             and not current_platform.is_rocm()
-            and envs.VLLM_P2P_OVERRIDE_FULLY_CONNECTED
+            and envs.VLLM_P2P_FULLY_CONNECTED_OVERRIDE
         ):
-            if _can_p2p(rank, world_size):
+            # Map every rank's physical device to its CUDA-visible device index
+            # (mirrors the SM70 hierarchical path): group rank != device index
+            # in general (e.g. CUDA_VISIBLE_DEVICES=2,3,4,5).
+            rank_device_indices: list[int] = []
+            for physical_id in physical_device_ids:
+                if physical_id in device_ids:
+                    rank_device_indices.append(device_ids.index(physical_id))
+                else:
+                    rank_device_indices.append(-1)
+            my_dev_idx = rank_device_indices[rank]
+            local_edges: list[bool] = []
+            for j, dev_j in enumerate(rank_device_indices):
+                if j == rank or my_dev_idx < 0 or dev_j < 0:
+                    local_edges.append(False)
+                else:
+                    local_edges.append(
+                        torch.cuda.can_device_access_peer(my_dev_idx, dev_j)
+                    )
+            local_edges[rank] = True  # self edge is trivially fine
+            edge_matrix: list[list[bool]] = [[] for _ in range(world_size)]
+            dist.all_gather_object(edge_matrix, local_edges, group=self.group)
+            all_p2p = all(
+                edge_matrix[src][dst]
+                for src in range(world_size)
+                for dst in range(world_size)
+                if src != dst
+            )
+            if all_p2p:
                 fully_connected = True
                 pcie_fully_connected = True
                 logger.info(
                     "[PASCAL] Custom allreduce enabled for a non-NVLink PCIe "
-                    "group of %d GPUs: all P2P edges verified, treating the "
-                    "group as fully connected (VLLM_P2P_OVERRIDE_FULLY_CONNECTED=1)."
-                    " Dispatch uses the existing multi-GPU allreduce kernels.",
+                    "group of %d GPUs: complete all-pairs P2P check passed, "
+                    "treating the group as fully connected. Dispatch uses the "
+                    "existing multi-GPU allreduce kernels.",
                     world_size,
                 )
             else:
                 logger.warning(
-                    "[PASCAL] VLLM_P2P_OVERRIDE_FULLY_CONNECTED=1 was set but "
-                    "the group is not fully P2P-capable (P2P check failed); "
-                    "leaving custom allreduce disabled."
+                    "[PASCAL] P2P fully-connected override active but the "
+                    "complete all-pairs P2P check FAILED (missing edge(s) in "
+                    "the matrix above); custom allreduce stays disabled. "
+                    "Edge matrix (src->dst): %s",
+                    edge_matrix,
                 )
-                self.disabled = True
-                return
         if world_size > 2 and not fully_connected:
             sm70_tp8_candidate = (
                 envs.VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR
