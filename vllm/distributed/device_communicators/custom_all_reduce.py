@@ -195,9 +195,12 @@ class CustomAllreduce:
                 if j == rank or my_dev_idx < 0 or dev_j < 0:
                     local_edges.append(False)
                 else:
-                    local_edges.append(
-                        torch.cuda.can_device_access_peer(my_dev_idx, dev_j)
-                    )
+                    try:
+                        local_edges.append(
+                            torch.cuda.can_device_access_peer(my_dev_idx, dev_j)
+                        )
+                    except Exception:
+                        local_edges.append(False)
             local_edges[rank] = True  # self edge is trivially fine
             edge_matrix: list[list[bool]] = [[] for _ in range(world_size)]
             dist.all_gather_object(edge_matrix, local_edges, group=self.group)
