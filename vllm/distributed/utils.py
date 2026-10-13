@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import timedelta
 from typing import Any
 
@@ -138,6 +138,16 @@ def get_pp_indices(
     end_layer = start_layer + partitions[pp_rank]
 
     return (start_layer, end_layer)
+
+
+def get_layers_outside_first_pp_rank(
+    layer_indices: Iterable[int], num_hidden_layers: int, pp_size: int
+) -> tuple[list[int], int]:
+    """Return layer indices the pipeline partition places beyond the first
+    rank, plus the exclusive end of the first rank's range."""
+    _, first_rank_end = get_pp_indices(num_hidden_layers, 0, pp_size)
+    misplaced = sorted(index for index in layer_indices if index >= first_rank_end)
+    return misplaced, first_rank_end
 
 
 def create_tcp_store(

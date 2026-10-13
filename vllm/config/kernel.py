@@ -157,6 +157,38 @@ LinearBackend = Literal[
 
 @config
 class KernelConfig:
+
+    # ---- Qwen4Exp/flash-next port: SM70-only flags (disabled on Pascal) ----
+    sm70_fp16_gemv_silu: bool = False
+    sm70_hc_fused: bool = False
+    sm70_dmv13_prepacked: bool = False
+    sm70_online_qpn8: bool = False
+    sm70_hc_weight_storage: str = "disabled"
+    sm70_hc_storage_layout: str = "disabled"
+    sm70_hc_quantize: bool = False
+    sm70_hc_qpn8: bool = False
+    sm70_hc_mxfp8: bool = False
+    sm70_hc_mxfp8_qpn8: bool = False
+    sm70_hc_dmv13_prepacked: bool = False
+    sm70_hc_dmv13_qpn8: bool = False
+    sm70_hc_dmv13_mxfp8: bool = False
+    sm70_hc_dmv13_mxfp8_qpn8: bool = False
+    sm70_moe: bool = False
+    sm70_nvfp4_moe: bool = False
+    sm70_fp8_moe: bool = False
+    sm70_dmv13_moe: bool = False
+    sm70_dmv13_moe_qpn8: bool = False
+    sm70_dmv13_moe_mxfp8: bool = False
+    sm70_dmv13_moe_mxfp8_qpn8: bool = False
+    sm70_dmv13_moe_fused_gate: bool = False
+    sm70_gguf: Any = None
+    sm70_mtp_batch: bool = False
+    qsa_e4m3: bool = False
+    qsa_topk_sidecar: bool = False
+    qsa_e4m3_fused: bool = False
+    qsa_e4m3_sidecar: bool = False
+    collective_kernel_selections: dict = Field(default_factory=dict)
+
     """Configuration for kernel selection and warmup behavior."""
 
     ir_op_priority: IrOpPriorityConfig = Field(default_factory=IrOpPriorityConfig)
