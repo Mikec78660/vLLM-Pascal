@@ -143,6 +143,7 @@ __all__ = [
     "QianfanOCRVisionConfig",
     "Qwen3ASRConfig",
     "Qwen3NextConfig",
+    "Qwen4ExpConfig",
     "Qwen3_5Config",
     "Qwen3_5TextConfig",
     "Qwen3_5MoeConfig",
