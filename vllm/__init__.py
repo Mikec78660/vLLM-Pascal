@@ -106,3 +106,16 @@ __all__ = [
     "initialize_ray_cluster",
     "PoolingParams",
 ]
+
+
+# Qwen4Exp port: expose the compiled op modules if present. These C extensions
+# are only built with CUDA; on a build-only host the import is skipped and the
+# SM70 paths that need them are disabled, so the package still imports.
+try:
+    from vllm import _custom_ops as _custom_ops  # noqa: F401
+except Exception:  # pragma: no cover
+    _custom_ops = None
+try:
+    from vllm import _sm70_ops as _sm70_ops  # noqa: F401
+except Exception:  # pragma: no cover
+    _sm70_ops = None

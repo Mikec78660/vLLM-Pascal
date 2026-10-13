@@ -246,3 +246,8 @@ __all__ = [
     "register_quantization_config",
     "QUANTIZATION_METHODS",
 ]
+
+def __getattr__(name):
+    if name == "gguf_dmv13_dense":
+        return None
+    raise AttributeError(name)

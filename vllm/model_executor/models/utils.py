@@ -892,3 +892,61 @@ def scatter_output_slices(
         sliced = output[offset : offset + n_tok]
         dest[idx] = sliced.clone() if clone else sliced
         offset += n_tok
+
+
+# Qwen4Exp port: fold shared-expert weights into routed-expert tensors
+# at load so the MoE GEMM is a single grouped call.
+def maybe_fuse_shared_experts(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    *,
+    n_routed_experts: int,
+    n_shared_experts: int,
+    ckpt_prefix: str = "mlp.shared_experts",
+    enabled: bool | None = None,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Route AITER fused-shared-expert weights into routed-expert slots.
+
+    CUDA leaves the input stream unchanged.  On ROCm, AITER can fuse shared
+    experts into the routed expert tensor; in that case split the checkpoint
+    tensor into the extra expert slots expected by ``RoutedExperts``.
+    """
+    if enabled is None:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+    if not enabled:
+        yield from weights
+        return
+
+    prefix = f"{ckpt_prefix}."
+    for name, loaded_weight in weights:
+        if prefix not in name:
+            yield name, loaded_weight
+            continue
+
+        split_dim = 1 if ("down_proj.weight" in name and loaded_weight.ndim > 1) else 0
+        total = loaded_weight.shape[split_dim]
+        if total % n_shared_experts != 0:
+            raise ValueError(
+                f"FSE shared-expert weight {name!r} has size {total} along axis "
+                f"{split_dim}, not divisible by "
+                f"n_shared_experts={n_shared_experts}."
+            )
+        chunk = total // n_shared_experts
+        for shared_expert_idx in range(n_shared_experts):
+            chunk_slice = slice(
+                shared_expert_idx * chunk, (shared_expert_idx + 1) * chunk
+            )
+            if loaded_weight.ndim == 1:
+                chunk_weight = loaded_weight[chunk_slice]
+            elif split_dim == 0:
+                chunk_weight = loaded_weight[chunk_slice, :]
+            else:
+                chunk_weight = loaded_weight[:, chunk_slice]
+            yield (
+                name.replace(
+                    prefix,
+                    f"mlp.experts.{n_routed_experts + shared_expert_idx}.",
+                ),
+                chunk_weight,
+            )

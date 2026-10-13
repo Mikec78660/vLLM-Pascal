@@ -32,3 +32,17 @@ class ShortConvAttentionMetadataBuilder(
     BaseMambaAttentionMetadataBuilder[ShortConvAttentionMetadata]
 ):
     metadata_cls = ShortConvAttentionMetadata
+
+# Qwen4Exp port: PLE short-conv attention backend. On Pascal the PLE ngram
+# table is CPU-resident; the short-conv state path reuses the standard
+# ShortConv backend with PLE's metadata shape.
+class PleShortConvAttentionMetadata(ShortConvAttentionMetadata):
+    """PLE short-conv metadata (aliases the standard short-conv metadata)."""
+
+
+class PleShortConvAttentionBackend(ShortConvAttentionBackend):
+    """PLE short-conv backend (reuses the standard short-conv backend)."""
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "PLE_SHORT_CONV"

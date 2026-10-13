@@ -633,3 +633,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,
 }
+
+def sm70_flash_next_batch_qualified(vllm_config) -> bool:
+    """Qwen4Exp port: SM70 batched-MTP contract. Disabled on Pascal."""
+    return False

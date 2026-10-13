@@ -687,3 +687,7 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
 class GGUFUninitializedParameter(UninitializedParameter):
     cls_to_become = Parameter
     data_container: list[torch.Tensor]
+
+def dequantize_gguf_rows(*args, **kwargs):
+    """Qwen4Exp port: SM70 GGUF packed-row dequant. Disabled on Pascal."""
+    raise NotImplementedError("dequantize_gguf_rows is SM70-only; unavailable on Pascal")

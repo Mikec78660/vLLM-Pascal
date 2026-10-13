@@ -185,6 +185,13 @@ class AttentionSpec(KVCacheSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class CircularBufferSpec(AttentionSpec):
+    """QSA uncompressed key ring spec. Pascal: QSA is disabled (no E4M3 tensor
+    cores), so this spec is never instantiated here; the plain subclass exists
+    only so the qwen4_exp package imports. head_size_v mirrors AttentionSpec."""
+
+    head_size_v: int = 0
+
 class FullAttentionSpec(AttentionSpec):
     """
     When hybrid allocator is disabled and the model contains both full

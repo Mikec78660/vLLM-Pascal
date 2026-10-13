@@ -2732,3 +2732,7 @@ def get_layers_from_vllm_config(
         for layer_name in layer_names
         if isinstance(layer := forward_context.get(layer_name), layer_type)
     }
+
+def _is_sm70_qwen38_decode_compile_contract(model_config, speculative_config, parallel_config) -> bool:
+    """Qwen4Exp port: SM70 decode-graph compile contract. Disabled on Pascal."""
+    return False

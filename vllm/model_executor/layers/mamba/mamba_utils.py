@@ -349,6 +349,13 @@ def get_temporal_copy_spec(
     )
 
 
+# Qwen4Exp port: mapping of mamba backend -> its per-state copy funcs. Pascal
+# uses a str-keyed map (no SM70 backend enum); the value type is a mapping of
+# state name -> copy callable.
+MambaStateCopyFuncs: TypeAlias = dict[str, MambaStateCopyFunc]
+MambaStateCopyFuncsByType: TypeAlias = dict[str, MambaStateCopyFuncs]
+
+
 class MambaStateCopyFuncCalculator:
     @classmethod
     def linear_attention_state_copy_func(cls):
