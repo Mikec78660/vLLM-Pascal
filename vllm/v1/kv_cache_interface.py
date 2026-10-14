@@ -198,6 +198,8 @@ class CircularBufferSpec(AttentionSpec):
 
     head_size_v: int = 0
 
+
+@dataclass(frozen=True, kw_only=True)
 class FullAttentionSpec(AttentionSpec):
     """
     When hybrid allocator is disabled and the model contains both full
