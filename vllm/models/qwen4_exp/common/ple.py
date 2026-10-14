@@ -342,7 +342,6 @@ def kv_cache_bytes_for_max_model_len(vllm_config: "VllmConfig") -> int:
         # PLE placement only needs a byte estimate, so fall back to the
         # per-layer sum -- no unification, always safe. Overestimating the
         # KV bytes only spills more of the table to host RAM, never less.
-        from math import cdiv
         from vllm.utils.math_utils import cdiv as _cdiv
         total = 0
         skipped = 0
