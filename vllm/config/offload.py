@@ -77,6 +77,34 @@ class PrefetchOffloadConfig:
 
 
 @config
+@config
+class PleOffloadConfig:
+    """Qwen4Exp PLE (ngram embedding table) host/device placement.
+
+    The PLE table is large (tens of GiB for 20M-row ngram tables). On
+    pre-Ampere GPUs it is split between device memory and pinned host
+    memory; these budgets (GiB per rank) drive the split. Populated
+    from the VLLM_QWEN4EXP_PLE_* environment variables by VllmConfig.
+    """
+
+    host_gib: float = 0.0
+    """Pinned-host GiB per rank for the PLE table (0 = auto-derive)."""
+
+    host_reserve_gib: float = 0.0
+    """Host GiB kept free for everything else (0 = auto)."""
+
+    vram_reserve_gib: float = 0.0
+    """Device GiB kept free beside the table (0 = auto)."""
+
+    def gib_bytes(self, field: str) -> int | None:
+        """Configured bytes for a placement field, or None when unset."""
+
+        value = getattr(self, field, 0.0)
+        if not value:
+            return None
+        return int(value * 1024**3)
+
+
 class OffloadConfig:
     """Configuration for model weight offloading to reduce GPU memory usage."""
 
@@ -92,6 +120,8 @@ class OffloadConfig:
     """Parameters for UVA offloading backend."""
 
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
+    ple: PleOffloadConfig = Field(default_factory=PleOffloadConfig)
+    """Qwen4Exp PLE table placement (populated from env by VllmConfig)."""
     """Parameters for prefetch offloading backend."""
 
     @model_validator(mode="after")

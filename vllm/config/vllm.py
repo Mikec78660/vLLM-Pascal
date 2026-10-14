@@ -886,6 +886,29 @@ class VllmConfig:
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
 
+        # Qwen4Exp PLE placement: map the VLLM_QWEN4EXP_PLE_* env vars
+        # into offload_config.ple (the ported model reads it there).
+        if self.offload_config is not None:
+            import vllm.envs as _envs
+
+            _ple = self.offload_config.ple
+            if getattr(_ple, "host_gib", 0.0) == 0.0 and _envs.VLLM_QWEN4EXP_PLE_HOST_GIB:
+                _ple.host_gib = float(_envs.VLLM_QWEN4EXP_PLE_HOST_GIB)
+            if (
+                getattr(_ple, "host_reserve_gib", 0.0) == 0.0
+                and _envs.VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB
+            ):
+                _ple.host_reserve_gib = float(
+                    _envs.VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB
+                )
+            if (
+                getattr(_ple, "vram_reserve_gib", 0.0) == 0.0
+                and _envs.VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB
+            ):
+                _ple.vram_reserve_gib = float(
+                    _envs.VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB
+                )
+
         if self.performance_mode != "balanced":
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 

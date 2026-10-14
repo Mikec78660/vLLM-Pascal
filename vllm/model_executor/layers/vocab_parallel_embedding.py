@@ -433,9 +433,9 @@ class VocabParallelEmbedding(PluggableLayer):
         org_num_embeddings: original vocabulary size (without LoRA).
         padding_size: padding size for the vocabulary.
         quant_config: quant config for the layer
-        quant_method: optional pre-resolved quant method (overrides
-            quant_config; used by Qwen4Exp PLE/GGUF embeddings)
         prefix: full name of the layer in the state dict
+        quant_method: optional pre-resolved quant method (keyword in
+            practice; overrides quant_config; Qwen4Exp PLE/GGUF)
     """  # noqa: E501
 
     # --8<-- [end:vocab_parallel_embedding]
@@ -448,8 +448,8 @@ class VocabParallelEmbedding(PluggableLayer):
         org_num_embeddings: int | None = None,
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: QuantizationConfig | None = None,
-        quant_method: QuantizeMethodBase | None = None,
         prefix: str = "",
+        quant_method: QuantizeMethodBase | None = None,
     ):
         super().__init__()
         self.prefix = prefix

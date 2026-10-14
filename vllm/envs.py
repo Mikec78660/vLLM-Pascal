@@ -522,6 +522,10 @@ if TYPE_CHECKING:
     VLLM_QSA_DUMP_DIR: str | None = None
     VLLM_PLE_DISK_OFFLOAD_NUM_THREADS: int = 0
     VLLM_NVFP4_REQUIRE_CAP: bool = False
+    VLLM_QWEN4EXP_PLE_HOST_GIB: float = None
+    VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float = None
+    VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float = None
+    VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
     VLLM_PLE_DISK_OFFLOAD_PROFILE: bool = False
     VLLM_DP_RANK: int = 0
     VLLM_DP_RANK_LOCAL: int = -1
@@ -3104,7 +3108,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Diagnostics: dir to dump QSA prefill reader inputs (off unless set).
 "VLLM_QSA_DUMP_DIR": lambda: os.getenv("VLLM_QSA_DUMP_DIR"),    # PLE disk mmap reader thread pool (0 = auto = min(32, cpu_count)).
 "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS": lambda: int(os.getenv("VLLM_PLE_DISK_OFFLOAD_NUM_THREADS", "0")),
-"VLLM_NVFP4_REQUIRE_CAP": lambda: bool(int(os.getenv("VLLM_NVFP4_REQUIRE_CAP", "0"))),    # PLE disk mmap gather fault/timing profile logging (0 = off).
+"VLLM_NVFP4_REQUIRE_CAP": lambda: bool(int(os.getenv("VLLM_NVFP4_REQUIRE_CAP", "0"))),
+# Qwen4Exp PLE placement (pinned-host ngram table budget, GiB per rank)
+"VLLM_QWEN4EXP_PLE_HOST_GIB": lambda: float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_GIB", "0")) or None,
+"VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": lambda: float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "0")) or None,
+"VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB": lambda: float(os.getenv("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB", "0")) or None,
+"VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES": lambda: bool(int(os.getenv("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", "0"))),    # PLE disk mmap gather fault/timing profile logging (0 = off).
 "VLLM_PLE_DISK_OFFLOAD_PROFILE": lambda: bool(int(os.getenv("VLLM_PLE_DISK_OFFLOAD_PROFILE", "0"))),    # Rank of the process in the data parallel setting
     "VLLM_DP_RANK": lambda: int(os.getenv("VLLM_DP_RANK", "0")),
     # Rank of the process in the data parallel setting.

@@ -36,7 +36,16 @@ def ple_cascade_configured():
 
 
 class PlePlacementPolicy:
-    aliases = {}
+    """Env-var aliases for the PLE placement policy fields.
+
+    The Pascal fork has no SM70 execution-policy subsystem, so the
+    policy is read from the VLLM_QWEN4EXP_PLE_* environment variables.
+    """
+    aliases = {
+        "host_gib": "VLLM_QWEN4EXP_PLE_HOST_GIB",
+        "host_reserve_gib": "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB",
+        "vram_reserve_gib": "VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB",
+    }
 
     def __getattr__(self, name):
         return False
