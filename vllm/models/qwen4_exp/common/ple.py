@@ -333,8 +333,25 @@ def kv_cache_bytes_for_max_model_len(vllm_config: "VllmConfig") -> int:
         spec = layer.get_kv_cache_spec(vllm_config)
         if spec is not None:
             specs[name] = spec
-    groups = get_kv_cache_groups(vllm_config, specs)
-    return _max_memory_usage_bytes_from_groups(vllm_config, groups)
+    try:
+        groups = get_kv_cache_groups(vllm_config, specs)
+        return _max_memory_usage_bytes_from_groups(vllm_config, groups)
+    except (NotImplementedError, AssertionError):
+        # Hybrid models (QSA compressed MLA page vs GDN short-conv page) can
+        # be non-unifiable at the settled block size on this backend. The
+        # PLE placement only needs a byte estimate, so fall back to the
+        # per-layer sum -- no unification, always safe. Overestimating the
+        # KV bytes only spills more of the table to host RAM, never less.
+        total = 0
+        for spec in specs.values():
+            total += spec.max_memory_usage_bytes(vllm_config)
+        logger.info(
+            "Qwen4Exp PLE: hybrid KV groups could not be unified (%d layers); "
+            "using per-layer KV estimate %d bytes",
+            len(specs),
+            total,
+        )
+        return total
 
 
 def auto_ple_host_budget_bytes(
