@@ -189,6 +189,44 @@ class KernelConfig:
     qsa_e4m3_sidecar: bool = False
     collective_kernel_selections: dict = Field(default_factory=dict)
 
+    # ---- Qwen4Exp port: remaining V100-fork flag symbols (all disabled on
+    # Pascal). Bool fast-path flags default False; the two SM70 HCX tuning
+    # knobs default None (inherited); storage/selection strings mirror the
+    # existing sm70_hc_weight_storage style; counters default 0; dicts empty.
+    # None of these are ever enabled on this branch. ----
+    hc_weight_storage: str = "disabled"
+    sm70_router_weight_storage: str = "dual"
+    sm70_hcx: bool = False
+    sm70_hcx_diagnostics: bool = False
+    sm70_hcx_local_schedule: bool = False
+    sm70_hcx_output_projection: bool = False
+    sm70_top1x: bool = False
+    sm70_fused_side_projections: bool = False
+    sm70_mtp_lossless_storage: bool = False
+    sm70_mtp_q8_0_experts: bool = False
+    sm70_draft_hot_vocab: int = 0
+    sm70_draft_hot_vocab_ids: int = 0
+    sm70_qsa_prep: bool = False
+    sm70_qsa_shared_key: bool = False
+    sm70_qsa_device_history: bool = False
+    sm70_qsa_host_native: bool = False
+    qsa_auto_e4m3_active: bool = False
+    qsa_dense_short_context: bool = False
+    qsa_host_kv_active: bool = False
+    qsa_host_kv_hot_tokens: int = 0
+    qsa_host_kv_staging_rows: int = 0
+    qsa_host_kv_prefill_stage_tokens: int = 0
+    qsa_host_kv_dtype: str = ""
+    qsa_host_kv_draft_dtype: str = ""
+    qsa_host_kv_device_reference: bool = False
+    ple_input_prepare: bool = False
+    ple_input_preparations: dict = Field(default_factory=dict)
+    ple_disk_only: bool = False
+    ple_disk_cascade: bool = False
+    ple_disk_release_pages: bool = False
+    ple_disk_row_readers: dict = Field(default_factory=dict)
+
+
     """Configuration for kernel selection and warmup behavior."""
 
     ir_op_priority: IrOpPriorityConfig = Field(default_factory=IrOpPriorityConfig)

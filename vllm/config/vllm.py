@@ -343,6 +343,12 @@ class VllmConfig:
     """LoRA configuration."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
+
+    @property
+    def is_speculative_draft(self) -> bool:
+        """True when this config belongs to the speculative-draft model.
+        Used by the Qwen4Exp port to retain per-owner cache policies."""
+        return self.speculative_config is not None
     structured_outputs_config: StructuredOutputsConfig = Field(
         default_factory=StructuredOutputsConfig
     )
