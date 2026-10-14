@@ -147,6 +147,12 @@ class AttentionSpec(KVCacheSpec):
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
+    # QSA / DCP / host-KV flags (upstream parity). Inert on Pascal: QSA is
+    # disabled (no E4M3 tensor cores) and no fork-side reader exists, so the
+    # defaults keep every spec byte-identical while letting the ported
+    # qwen4_exp spec ctors pass the kwargs.
+    dcp_sharded: bool = False
+    host_backed: bool = False
 
     @property
     def page_size_bytes(self) -> int:
@@ -267,6 +273,8 @@ class FullAttentionSpec(AttentionSpec):
             page_size_padded=specs[0].page_size_padded,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
+            dcp_sharded=specs[0].dcp_sharded,
+            host_backed=specs[0].host_backed,
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -402,6 +410,8 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            dcp_sharded=specs[0].dcp_sharded,
+            host_backed=specs[0].host_backed,
         )
 
 
@@ -567,6 +577,8 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            dcp_sharded=specs[0].dcp_sharded,
+            host_backed=specs[0].host_backed,
         )
 
 
@@ -658,6 +670,8 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             page_size_padded=specs[0].page_size_padded,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
+            dcp_sharded=specs[0].dcp_sharded,
+            host_backed=specs[0].host_backed,
         )
         for spec in specs:
             for f in fields(AttentionSpec):
