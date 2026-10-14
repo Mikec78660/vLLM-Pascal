@@ -306,7 +306,6 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
             ckpt_up_proj_name="up_proj",
             num_experts=self.n_routed_experts,
             num_redundant_experts=self.n_redundant_experts,
-            include_fused=True,
         )
 
 
