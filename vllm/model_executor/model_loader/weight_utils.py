@@ -889,6 +889,28 @@ def _prefetch_all_checkpoints(
     )
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
+def _drop_checkpoint_shard_page_cache(path: str) -> None:
+    """Evict a fully-read checkpoint shard from page cache.
+
+    The default loader memory-maps each safetensors shard, so its pages sit in
+    page cache even after every tensor has been copied out (to the device, or to
+    the pinned PLE host table). On a RAM-tight box the accumulated cache of a
+    large checkpoint competes with the pinned tables for the same memory and can
+    trigger an OOM kill mid-load. Each shard is read exactly once, so dropping
+    its cache as soon as it is fully consumed is safe: it only costs a re-read
+    if the same file is ever opened again, which the normal load does not.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.posix_fadvise(fd, os.POSIX_FADV_DONTNEED, 0, 0)
+    except (OSError, AttributeError):
+        pass
+    finally:
+        os.close(fd)
+
 
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
@@ -985,6 +1007,7 @@ def safetensors_weights_iterator(
         if safetensors_load_strategy == "eager":
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
+            _drop_checkpoint_shard_page_cache(st_file)
             for name, param in state_dict.items():
                 if not should_skip_weight(name, local_expert_ids):
                     yield name, param
@@ -1025,6 +1048,11 @@ def safetensors_weights_iterator(
                         continue
                     param = f.get_tensor(name)
                     yield name, param
+            # All of this file's tensors have been copied out (device weights /
+            # pinned PLE table) and the mmap is closed. Free the page cache so a
+            # large checkpoint does not accumulate a full copy of itself in RAM
+            # beside the pinned PLE table and OOM the box mid-load.
+            _drop_checkpoint_shard_page_cache(st_file)
 
 
 def multi_thread_safetensors_weights_iterator(
