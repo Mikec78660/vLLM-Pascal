@@ -219,6 +219,15 @@ class KernelConfig:
     qsa_host_kv_dtype: str = ""
     qsa_host_kv_draft_dtype: str = ""
     qsa_host_kv_device_reference: bool = False
+    # QSA host KV / indexer-history / PLE-disk controls read by the ported
+    # tree's spec construction and GGUF embedding paths. All default off:
+    # QSA host storage and the PLE disk cascade are SM70+ fast paths that
+    # stay disabled on Pascal (no E4M3 tensor cores).
+    qsa_host_kv: bool = False
+    qsa_host_kv_reason: str = ""
+    qsa_host_indexer_history: bool = False
+    ple_disk_row_gather: bool = False
+    ple_fast_lane: bool = False
     ple_input_prepare: bool = False
     ple_input_preparations: dict = Field(default_factory=dict)
     ple_disk_only: bool = False
