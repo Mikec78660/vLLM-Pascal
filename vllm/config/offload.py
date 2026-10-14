@@ -77,7 +77,6 @@ class PrefetchOffloadConfig:
 
 
 @config
-@config
 class PleOffloadConfig:
     """Qwen4Exp PLE (ngram embedding table) host/device placement.
 
@@ -105,6 +104,7 @@ class PleOffloadConfig:
         return int(value * 1024**3)
 
 
+@config
 class OffloadConfig:
     """Configuration for model weight offloading to reduce GPU memory usage."""
 
@@ -120,9 +120,9 @@ class OffloadConfig:
     """Parameters for UVA offloading backend."""
 
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
+    """Parameters for prefetch offloading backend."""
     ple: PleOffloadConfig = Field(default_factory=PleOffloadConfig)
     """Qwen4Exp PLE table placement (populated from env by VllmConfig)."""
-    """Parameters for prefetch offloading backend."""
 
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
