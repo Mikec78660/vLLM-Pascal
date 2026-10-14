@@ -623,12 +623,33 @@ class VllmConfig:
             if capability_tuple is not None:
                 capability = capability_tuple.to_int()
                 if capability < quant_config.get_min_capability():
-                    raise ValueError(
-                        f"The quantization method {model_config.quantization} "
-                        "is not supported for the current GPU. Minimum "
-                        f"capability: {quant_config.get_min_capability()}. "
-                        f"Current capability: {capability}."
-                    )
+                    # Pascal port: NVFP4 (ModelOpt FP4) has a software
+                    # emulation fallback (dequant to BF16 + torch/triton GEMM)
+                    # that works on SM6.x. Warn and continue instead of
+                    # hard-failing; the NVFP4 kernel selector picks the
+                    # Emulation backend there. Set VLLM_NVFP4_REQUIRE_CAP=1
+                    # to restore the strict raise.
+                    if (
+                        model_config.quantization == "modelopt_fp4"
+                        and not envs.VLLM_NVFP4_REQUIRE_CAP
+                    ):
+                        logger.warning(
+                            "Quantization method %s normally requires "
+                            "capability >= %d but the current GPU is %d; "
+                            "continuing with the NVFP4 software-emulation "
+                            "fallback (slow). Set VLLM_NVFP4_REQUIRE_CAP=1 "
+                            "to restore the hard failure.",
+                            model_config.quantization,
+                            quant_config.get_min_capability(),
+                            capability,
+                        )
+                    else:
+                        raise ValueError(
+                            f"The quantization method {model_config.quantization} "
+                            "is not supported for the current GPU. Minimum "
+                            f"capability: {quant_config.get_min_capability()}. "
+                            f"Current capability: {capability}."
+                        )
             supported_dtypes = quant_config.get_supported_act_dtypes()
             if model_config.dtype not in supported_dtypes:
                 raise ValueError(
