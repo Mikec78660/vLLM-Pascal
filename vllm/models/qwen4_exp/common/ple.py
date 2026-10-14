@@ -342,14 +342,31 @@ def kv_cache_bytes_for_max_model_len(vllm_config: "VllmConfig") -> int:
         # PLE placement only needs a byte estimate, so fall back to the
         # per-layer sum -- no unification, always safe. Overestimating the
         # KV bytes only spills more of the table to host RAM, never less.
+        from math import cdiv
+        from vllm.utils.math_utils import cdiv as _cdiv
         total = 0
-        for spec in specs.values():
-            total += spec.max_memory_usage_bytes(vllm_config)
+        skipped = 0
+        for name, spec in specs.items():
+            try:
+                total += spec.max_memory_usage_bytes(vllm_config)
+            except Exception:
+                # The base KVCacheSpec.max_memory_usage_bytes raises
+                # NotImplementedError for spec subclasses that never
+                # override it (e.g. CircularBufferSpec). Estimate from the
+                # page size instead: attention = one page per block over the
+                # context, everything else = a single page.
+                page = spec.page_size_bytes
+                if page > 0 and spec.block_size > 0:
+                    total += _cdiv(vllm_config.model_config.max_model_len, spec.block_size) * page
+                else:
+                    total += page
+                    skipped += 1
         logger.info(
             "Qwen4Exp PLE: hybrid KV groups could not be unified (%d layers); "
-            "using per-layer KV estimate %d bytes",
+            "using per-layer KV estimate %d bytes (%d layers page-estimated)",
             len(specs),
             total,
+            skipped,
         )
         return total
 
