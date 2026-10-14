@@ -5,7 +5,7 @@ import itertools
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, overload
+from typing import Any, Literal, Protocol, TypeAlias, overload
 
 import regex as re
 import torch
@@ -38,6 +38,9 @@ from vllm.utils.torch_utils import (
 logger = init_logger(__name__)
 
 
+ShardId: TypeAlias = str | int | tuple[int, ...]
+
+
 @dataclass
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns.
@@ -48,6 +51,7 @@ class WeightsMapper:
     orig_to_new_substr: Mapping[str, str | None] = field(default_factory=dict)
     orig_to_new_prefix: Mapping[str, str | None] = field(default_factory=dict)
     orig_to_new_suffix: Mapping[str, str | None] = field(default_factory=dict)
+    orig_to_new_stacked: Mapping[str, tuple[str, ShardId]] = field(default_factory=dict)
 
     def __or__(self, other: "WeightsMapper") -> "WeightsMapper":
         """Combine two `WeightsMapper`s by merging their mappings."""
@@ -55,9 +59,18 @@ class WeightsMapper:
             orig_to_new_substr={**self.orig_to_new_substr, **other.orig_to_new_substr},
             orig_to_new_prefix={**self.orig_to_new_prefix, **other.orig_to_new_prefix},
             orig_to_new_suffix={**self.orig_to_new_suffix, **other.orig_to_new_suffix},
+            orig_to_new_stacked={
+                **self.orig_to_new_stacked,
+                **other.orig_to_new_stacked,
+            },
         )
 
     def _map_name(self, key: str) -> str | None:
+        result = self._map_name_with_shard(key)
+        return result[0] if result is not None else None
+
+    def _map_name_with_shard(self, key: str) -> tuple[str, ShardId | None] | None:
+        """Map a weight name and extract any shard_id metadata."""
         for pattern, new_key in self.orig_to_new_regex.items():
             if pattern.search(key):
                 if new_key is None:
@@ -71,6 +84,12 @@ class WeightsMapper:
                     return None
 
                 key = key.replace(substr, new_key, 1)
+
+        shard_id: ShardId | None = None
+        for substr, (new_key, new_shard_id) in self.orig_to_new_stacked.items():
+            if substr in key:
+                key = key.replace(substr, new_key, 1)
+                shard_id = new_shard_id
 
         for prefix, new_key in self.orig_to_new_prefix.items():
             if key.startswith(prefix):
@@ -86,15 +105,27 @@ class WeightsMapper:
 
                 key = new_key.join(key.rsplit(suffix, 1))
 
-        return key
+        return key, shard_id
 
     def apply(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
+        def apply_with_name_and_shard_id(
+            name: str, data: torch.Tensor
+        ) -> tuple[str, torch.Tensor] | None:
+            result = self._map_name_with_shard(name)
+            if result is None:
+                return None
+
+            mapped_name, shard_id = result
+            if shard_id is not None:
+                data.shard_id = shard_id  # type: ignore[attr-defined]
+            return (mapped_name, data)
+
         return (
-            (out_name, data)
+            applied
             for name, data in weights
-            if (out_name := self._map_name(name)) is not None
+            if (applied := apply_with_name_and_shard_id(name, data)) is not None
         )
 
     def apply_list(self, values: list[str]) -> list[str]:
@@ -220,7 +251,11 @@ class AutoWeightsLoader:
                 )
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, weight_data)
+            shard_id = getattr(weight_data, "shard_id", None)
+            if shard_id is not None:
+                weight_loader(param, weight_data, shard_id)
+            else:
+                weight_loader(param, weight_data)
 
             logger.debug("Loaded weight %s with shape %s", weight_qualname, param.shape)
 

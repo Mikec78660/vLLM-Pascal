@@ -519,6 +519,9 @@ if TYPE_CHECKING:
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
+    VLLM_QSA_DUMP_DIR: str | None = None
+    VLLM_PLE_DISK_OFFLOAD_NUM_THREADS: int = 0
+    VLLM_PLE_DISK_OFFLOAD_PROFILE: bool = False
     VLLM_DP_RANK: int = 0
     VLLM_DP_RANK_LOCAL: int = -1
     VLLM_DP_SIZE: int = 1
@@ -3097,7 +3100,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # In some system, find_loaded_library() may not work. So we allow users to
     # specify the path through environment variable VLLM_CUDART_SO_PATH.
     "VLLM_CUDART_SO_PATH": lambda: os.getenv("VLLM_CUDART_SO_PATH", None),
-    # Rank of the process in the data parallel setting
+    # Diagnostics: dir to dump QSA prefill reader inputs (off unless set).
+"VLLM_QSA_DUMP_DIR": lambda: os.getenv("VLLM_QSA_DUMP_DIR"),    # PLE disk mmap reader thread pool (0 = auto = min(32, cpu_count)).
+"VLLM_PLE_DISK_OFFLOAD_NUM_THREADS": lambda: int(os.getenv("VLLM_PLE_DISK_OFFLOAD_NUM_THREADS", "0")),    # PLE disk mmap gather fault/timing profile logging (0 = off).
+"VLLM_PLE_DISK_OFFLOAD_PROFILE": lambda: bool(int(os.getenv("VLLM_PLE_DISK_OFFLOAD_PROFILE", "0"))),    # Rank of the process in the data parallel setting
     "VLLM_DP_RANK": lambda: int(os.getenv("VLLM_DP_RANK", "0")),
     # Rank of the process in the data parallel setting.
     # Defaults to VLLM_DP_RANK when not set.
