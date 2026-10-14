@@ -433,6 +433,8 @@ class VocabParallelEmbedding(PluggableLayer):
         org_num_embeddings: original vocabulary size (without LoRA).
         padding_size: padding size for the vocabulary.
         quant_config: quant config for the layer
+        quant_method: optional pre-resolved quant method (overrides
+            quant_config; used by Qwen4Exp PLE/GGUF embeddings)
         prefix: full name of the layer in the state dict
     """  # noqa: E501
 
@@ -446,6 +448,7 @@ class VocabParallelEmbedding(PluggableLayer):
         org_num_embeddings: int | None = None,
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: QuantizationConfig | None = None,
+        quant_method: QuantizeMethodBase | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -476,11 +479,13 @@ class VocabParallelEmbedding(PluggableLayer):
         )
         self.embedding_dim = embedding_dim
 
-        quant_method = None
-        if quant_config is not None:
-            quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if quant_method is None:
-            quant_method = UnquantizedEmbeddingMethod()
+            if quant_config is not None:
+                quant_method = quant_config.get_quant_method(
+                    self, prefix=prefix
+                )
+            if quant_method is None:
+                quant_method = UnquantizedEmbeddingMethod()
 
         # If we are making an embedding layer, then our quantization linear
         # method must implement the embedding operation. If we are another
