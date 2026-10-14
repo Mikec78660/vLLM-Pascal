@@ -202,7 +202,7 @@ class FullAttentionSpec(AttentionSpec):
     In this case, we use FullAttentionSpec and record the sliding window size.
     """
 
-    head_size_v: int = None  # type: ignore[assignment]
+    head_size_v: int = 0  # type: ignore[assignment]  (0 == 'same as head_size'; guarded in real_page_size_bytes)
 
     sliding_window: int | None = None
     """
@@ -288,19 +288,21 @@ class FullAttentionSpec(AttentionSpec):
             # Packed layout per head: fp4 data + fp8 block scales.
             # fp4 data: head_size//2 bytes (2 fp4 values per byte)
             # fp8 block scale: head_size//16 bytes (1 scale per 16 elements)
+            _hsv = self.head_size_v if self.head_size_v else self.head_size
             last_dim = nvfp4_kv_cache_full_dim(
                 self.head_size
-            ) + nvfp4_kv_cache_full_dim(self.head_size_v)
+            ) + nvfp4_kv_cache_full_dim(_hsv)
             return (
                 self.block_size
                 * self.num_kv_heads
                 * last_dim
                 * get_dtype_size(self.dtype)
             )
+        _hsv = self.head_size_v if self.head_size_v else self.head_size
         return (
             self.block_size
             * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
+            * (self.head_size + _hsv)
             * get_dtype_size(self.dtype)
         )
 
@@ -441,7 +443,7 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowSpec(AttentionSpec):
     sliding_window: int
-    head_size_v: int = None  # type: ignore[assignment]
+    head_size_v: int = 0  # type: ignore[assignment]  (0 == 'same as head_size'; guarded in real_page_size_bytes)
 
     def __post_init__(self):
         if self.head_size_v is None:
@@ -451,19 +453,21 @@ class SlidingWindowSpec(AttentionSpec):
     def real_page_size_bytes(self) -> int:
         # Mirror ``FullAttentionSpec.real_page_size_bytes`` for NVFP4 KV cache.
         if self.kv_quant_mode.is_nvfp4:
+            _hsv = self.head_size_v if self.head_size_v else self.head_size
             last_dim = nvfp4_kv_cache_full_dim(
                 self.head_size
-            ) + nvfp4_kv_cache_full_dim(self.head_size_v)
+            ) + nvfp4_kv_cache_full_dim(_hsv)
             return (
                 self.block_size
                 * self.num_kv_heads
                 * last_dim
                 * get_dtype_size(self.dtype)
             )
+        _hsv = self.head_size_v if self.head_size_v else self.head_size
         return (
             self.block_size
             * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
+            * (self.head_size + _hsv)
             * get_dtype_size(self.dtype)
         )
 
