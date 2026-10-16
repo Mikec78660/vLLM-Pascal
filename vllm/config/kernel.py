@@ -228,6 +228,12 @@ class KernelConfig:
     qsa_host_indexer_history: bool = False
     ple_disk_row_gather: bool = False
     ple_fast_lane: bool = False
+    ple_row_cache_mib: int = Field(default=1536, ge=0)
+    ple_draft_prefetch: bool = True
+    ple_result_transport: Literal["auto", "cuda", "mapped"] = "cuda"
+    ple_result_transports: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
     ple_input_prepare: bool = False
     ple_input_preparations: dict = Field(default_factory=dict)
     ple_disk_only: bool = False

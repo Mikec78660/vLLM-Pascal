@@ -1183,10 +1183,20 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         self._remote_placements: list[PLERemotePlacement] = []
         self._disk_segments: list[PLEDiskSegment] = []
         self._disk_offload = bool(ple_policy().disk and is_offload_process())
+        # In-process disk lane: with only VLLM_PLE_DISK_OFFLOAD set (no CPU
+        # offload, no cascade, no pinned decode), the GPU process streams the
+        # whole table from its own file-backed mmap instead of pinning it in
+        # host RAM (which OOMs a tight box) or loading it into VRAM.
+        self._inprocess_disk = bool(
+            ple_policy().disk
+            and not is_offload_process()
+            and not self._cascade
+            and not self._pinned_decode
+        )
         # The cascade worker keeps the checkpoint shards file-backed like the
         # disk lane: it serves only the rows the ranks do not hold and copies
         # none of the table into anonymous host memory.
-        self._file_backed_shards = self._disk_offload or (
+        self._file_backed_shards = self._disk_offload or self._inprocess_disk or (
             self._cascade and is_offload_process()
         )
         self._disk_shards: list[torch.Tensor | None] = []
@@ -1821,6 +1831,37 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 faults_after.ru_minflt - faults_before.ru_minflt,
             )
 
+    def _inprocess_disk_gather(
+        self,
+        ngram_ids: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """In-process disk lane: gather this batch's rows from the mmap.
+
+        The whole table stays a file-backed mmap (page cache). Each step
+        reads only the requested rows on CPU, copies just those rows to the
+        device, and dequantizes them with the same Pascal-proven byte-dequant
+        kernel the pinned-host lane uses. Returns dequantized rows so the
+        outer forward's dequantization step is a no-op.
+        """
+        device = ngram_ids.device
+        flat_ids = ngram_ids.reshape(-1).cpu().numpy()
+        if flat_ids.size == 0:
+            return torch.empty(
+                (0, self.embedding_dim), dtype=output_dtype, device=device
+            )
+        rows = self._gather_mapped_rows(flat_ids)  # uint8 CPU (N, head_dim)
+        row_bytes = torch.from_numpy(rows).to(device)
+        scale = getattr(self, "_disk_weight_scale", None)
+        if scale is None:
+            raise RuntimeError(
+                "PLE in-process disk lane is missing its global FP8 scale"
+            )
+        scale = scale.to(device)
+        out = torch.empty(row_bytes.shape, dtype=output_dtype, device=device)
+        torch.ops.vllm.qwen4_exp_ple_fp8_bytes_dequant(row_bytes, scale, out)
+        return out.reshape(-1, self.embedding_dim)
+
     def forward_impl(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
@@ -1831,12 +1872,26 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     ) -> torch.Tensor:
         input_ids = input_ids.reshape(-1)
         num_tokens = input_ids.shape[0]
-        if is_offload_process():
+        if is_offload_process() or getattr(self, "_inprocess_disk", False):
+            # The generic compute_ngram_ids fallback works on this layer's CPU
+            # workspaces (positions_buffer/padded_buffer/layer_multipliers are all
+            # CPU). The offload process feeds CPU tensors directly; the in-process
+            # disk lane copies the (small) inputs over, computes on CPU, and moves
+            # the ids back to the device. This is the Pascal-safe path (the SM70
+            # fused GPU op is disabled and its generic fallback cannot mix the
+            # GPU inputs with the CPU workspaces).
+            if not is_offload_process():
+                orig_device = input_ids.device
+                input_ids = input_ids.cpu()
+                query_start_loc = query_start_loc.cpu()
+                ngram_context = ngram_context.cpu()
             ngram_ids = self.compute_ngram_ids(
                 input_ids,
                 query_start_loc,
                 ngram_context,
             )
+            if not is_offload_process():
+                ngram_ids = ngram_ids.to(device=orig_device)
         else:
             ngram_ids = input_ids.new_empty(
                 (num_tokens, self.ngram_heads),
@@ -1892,6 +1947,13 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     out=embedding_output.reshape(-1, self.head_dim),
                 )
             return output
+        if getattr(self, "_inprocess_disk", False):
+            # In-process disk lane: the table is a file-backed mmap in this
+            # process. Gather this batch's rows from the mmap on CPU and copy
+            # only those rows to the device (never the whole 48GiB table).
+            # The host round-trip is not CUDA-graph-capturable, so this lane
+            # runs under eager execution (--enforce-eager).
+            return self._inprocess_disk_gather(ngram_ids, hidden_states.dtype)
         if self._is_cpu_offloaded and getattr(self, "_cascade", False):
             # Cascade: the resident tiers are gathered here, the rows beyond
             # them arrive from the worker in the shared output buffer.

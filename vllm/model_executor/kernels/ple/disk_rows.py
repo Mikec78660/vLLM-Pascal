@@ -13,7 +13,11 @@ class MappedRowGatherKernel:
 
 
 def prepare_mapped_row_gather(*a, **k):
-    return None
+    # Pascal port: the SM70 mapped-row-gather kernel is disabled,
+    # so there is no GPU reader. Return (None, admission) so both
+    # callers unpack a pair; the None reader routes the gather to
+    # the numpy mmap fallback.
+    return None, "pascal: no SM70 row kernel; numpy mmap gather"
 
 
 __all__ = ["MappedRowGatherKernel", "prepare_mapped_row_gather"]

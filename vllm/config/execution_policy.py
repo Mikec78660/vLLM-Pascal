@@ -20,7 +20,27 @@ def graph_policy(config=None):
 
 
 def ple_policy(config=None):
-    return _disabled
+    # Pascal: expose only the three PLE offload attributes the ported base
+    # class and model layer read (cpu/disk/hybrid); every other policy field
+    # stays disabled, as it did before the offload machinery was restored.
+    class _PlePolicy:
+        @property
+        def cpu(self):
+            import vllm.envs as _e
+
+            return bool(_e.VLLM_PLE_CPU_OFFLOAD)
+
+        @property
+        def disk(self):
+            import vllm.envs as _e
+
+            return bool(_e.VLLM_PLE_DISK_OFFLOAD)
+
+        @property
+        def hybrid(self):
+            return False
+
+    return _PlePolicy()
 
 
 def communication_policy(config=None):

@@ -532,6 +532,11 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float = None
     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
     VLLM_PLE_DISK_OFFLOAD_PROFILE: bool = False
+    VLLM_PLE_CPU_OFFLOAD: bool = False
+    VLLM_PLE_DISK_OFFLOAD: bool = False
+    VLLM_PLE_OFFLOAD_AUTO_NUMA: bool = True
+    VLLM_PLE_OFFLOAD_PREFAULT: bool = True
+    VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
     VLLM_DP_RANK: int = 0
     VLLM_DP_RANK_LOCAL: int = -1
     VLLM_DP_SIZE: int = 1
@@ -3126,7 +3131,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
 "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": lambda: float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "0")) or None,
 "VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB": lambda: float(os.getenv("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB", "0")) or None,
 "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES": lambda: bool(int(os.getenv("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", "0"))),    # PLE disk mmap gather fault/timing profile logging (0 = off).
-"VLLM_PLE_DISK_OFFLOAD_PROFILE": lambda: bool(int(os.getenv("VLLM_PLE_DISK_OFFLOAD_PROFILE", "0"))),    # Rank of the process in the data parallel setting
+"VLLM_PLE_DISK_OFFLOAD_PROFILE": lambda: bool(int(os.getenv("VLLM_PLE_DISK_OFFLOAD_PROFILE", "0"))),
+    # PLE CPU offload worker (dedicated process owns the ngram table).
+"VLLM_PLE_CPU_OFFLOAD": lambda: os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1"),
+    # Retain PLE shards as file-backed mappings (reclaimable) instead of anon.
+"VLLM_PLE_DISK_OFFLOAD": lambda: os.getenv("VLLM_PLE_DISK_OFFLOAD", "False").lower() in ("true", "1"),
+    "VLLM_PLE_OFFLOAD_AUTO_NUMA": lambda: os.getenv("VLLM_PLE_OFFLOAD_AUTO_NUMA", "True").lower() in ("true", "1"),
+    "VLLM_PLE_OFFLOAD_PREFAULT": lambda: os.getenv("VLLM_PLE_OFFLOAD_PREFAULT", "True").lower() in ("true", "1"),
+    "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")),    # Rank of the process in the data parallel setting
     "VLLM_DP_RANK": lambda: int(os.getenv("VLLM_DP_RANK", "0")),
     # Rank of the process in the data parallel setting.
     # Defaults to VLLM_DP_RANK when not set.

@@ -1321,6 +1321,25 @@ class GPUModelRunner(
         self.routed_experts_initialized = False
         self.max_model_len = model_config.max_model_len
 
+        ple_layer_ids = getattr(model_config.hf_text_config, "ple_layer_ids", ())
+        self.uses_ngram_embedding = bool(ple_layer_ids)
+        if self.uses_ngram_embedding:
+            self.ngram_context_len = int(model_config.hf_text_config.ngram_size) - 1
+            self.ngram_eos_token_id = int(model_config.hf_text_config.eos_token_id)
+        else:
+            self.ngram_context_len = 0
+            self.ngram_eos_token_id = 0
+        if self.uses_ngram_embedding and self.ngram_context_len <= 0:
+            raise ValueError("N-gram embedding requires context length >= 1")
+        if self.uses_ngram_embedding:
+            from vllm.models.qwen4_exp.common.ple import (
+                check_ple_layers_on_first_pp_rank,
+            )
+
+            check_ple_layers_on_first_pp_rank(
+                model_config.hf_text_config, parallel_config.pipeline_parallel_size
+            )
+
         # Always set to false after the first forward pass
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
@@ -1670,6 +1689,12 @@ class GPUModelRunner(
             self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
         )
         self.is_token_ids = self._make_buffer(self.max_num_tokens, dtype=torch.bool)
+        if self.uses_ngram_embedding:
+            self.ngram_context = self._make_buffer(
+                self.max_num_reqs,
+                self.ngram_context_len,
+                dtype=torch.int32,
+            )
         self.discard_request_mask = self._make_buffer(
             self.max_num_reqs, dtype=torch.bool
         )
@@ -6473,10 +6498,83 @@ class GPUModelRunner(
         inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
         return input_ids, inputs_embeds
 
+    def _prepare_ngram_context(
+        self,
+        num_reqs: int,
+        num_reqs_padded: int,
+    ) -> torch.Tensor:
+        """Copy committed per-request token history into the PLE context."""
+        if not self.uses_ngram_embedding:
+            raise RuntimeError("N-gram context requested for a non-PLE model")
+
+        eos_token_id = int(self.ngram_eos_token_id)
+        context_cpu = self.ngram_context.np[:num_reqs_padded]
+        context_cpu.fill(eos_token_id)
+        num_computed = self.input_batch.num_computed_tokens_cpu
+        token_ids = self.input_batch.token_ids_cpu
+        is_token_ids = self.input_batch.is_token_ids
+
+        for req_idx in range(num_reqs):
+            end = int(num_computed[req_idx])
+            if end <= 0:
+                continue
+            start = max(0, end - self.ngram_context_len)
+            context_tokens = token_ids[req_idx, start:end]
+            if context_tokens.size == 0:
+                continue
+            if self.enable_prompt_embeds and not is_token_ids[req_idx, start:end].all():
+                context_tokens = context_tokens.copy()
+                context_tokens[~is_token_ids[req_idx, start:end]] = eos_token_id
+            context_cpu[req_idx, -context_tokens.size :] = context_tokens
+
+        self._copy_buffer_to_gpu(self.ngram_context, num_reqs_padded)
+        return self.ngram_context.gpu[:num_reqs_padded]
+
+    def _maybe_add_ngram_kwargs(
+        self,
+        model_kwargs: dict[str, Any],
+        *,
+        num_reqs: int,
+        num_reqs_padded: int,
+        is_first_rank: bool,
+        is_encoder_decoder: bool,
+        use_dummy_context: bool,
+        query_start_loc: torch.Tensor | None = None,
+        num_scheduled_tokens: Sequence[int] | np.ndarray | None = None,
+    ) -> None:
+        if not self.uses_ngram_embedding or not is_first_rank or is_encoder_decoder:
+            return
+
+        if query_start_loc is None:
+            if num_scheduled_tokens is None:
+                raise RuntimeError("query_start_loc is required for N-gram PLE")
+            scheduled = np.asarray(num_scheduled_tokens, dtype=np.int32)
+            cu_num_tokens = np.cumsum(scheduled, dtype=np.int32)
+            last = int(cu_num_tokens[-1]) if num_reqs > 0 else 0
+            self.query_start_loc.np[0] = 0
+            if num_reqs > 0:
+                self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
+            self.query_start_loc.np[num_reqs + 1 :].fill(last)
+            self._copy_buffer_to_gpu(self.query_start_loc)
+            query_start_loc = self.query_start_loc.gpu[: num_reqs_padded + 1]
+        model_kwargs["query_start_loc"] = query_start_loc
+
+        if use_dummy_context:
+            self.ngram_context.np[:num_reqs_padded].fill(int(self.ngram_eos_token_id))
+            self._copy_buffer_to_gpu(self.ngram_context, num_reqs_padded)
+            model_kwargs["ngram_context"] = self.ngram_context.gpu[:num_reqs_padded]
+        else:
+            model_kwargs["ngram_context"] = self._prepare_ngram_context(
+                num_reqs,
+                num_reqs_padded,
+            )
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
         num_input_tokens: int,  # Padded
+        num_reqs: int,
+        num_reqs_padded: int,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> tuple[
         torch.Tensor | None,
@@ -6580,6 +6678,16 @@ class GPUModelRunner(
             # ever have a single encoder input.
             encoder_outputs = self._execute_mm_encoder(scheduler_output)
             model_kwargs.update({"encoder_outputs": encoder_outputs})
+
+        self._maybe_add_ngram_kwargs(
+            model_kwargs,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            is_first_rank=is_first_rank,
+            is_encoder_decoder=is_encoder_decoder,
+            use_dummy_context=False,
+            query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
+        )
 
         return (
             input_ids,
@@ -8314,7 +8422,11 @@ class GPUModelRunner(
                 model_kwargs,
                 ec_connector_output,
             ) = self._preprocess(
-                scheduler_output, num_tokens_padded, intermediate_tensors
+                scheduler_output,
+                num_tokens_padded,
+                self.input_batch.num_reqs,
+                num_reqs_padded,
+                intermediate_tensors,
             )
             if trace_log:
                 trace_model_preprocess_ms = (
@@ -10553,6 +10665,16 @@ class GPUModelRunner(
                     )
                 )
                 positions = self.positions[:num_tokens_padded]
+
+            self._maybe_add_ngram_kwargs(
+                model_kwargs,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                is_first_rank=get_pp_group().is_first_rank,
+                is_encoder_decoder=self.model_config.is_encoder_decoder,
+                use_dummy_context=True,
+                num_scheduled_tokens=num_scheduled_tokens,
+            )
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
