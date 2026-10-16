@@ -195,6 +195,7 @@ if TYPE_CHECKING:
     VLLM_SM70_UNQUANT_DEBUG: bool = False
     VLLM_SM70_SHARED_GATE_MAX_M: int = 64
     VLLM_SM70_FP8_DEQUANT_FALLBACK: bool = True
+    VLLM_PASCAL_FP8_Q80: bool = True
     VLLM_SM70_FP8_TURBOMIND: bool = True
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
@@ -1831,6 +1832,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and run regular fp16 linear.
     "VLLM_SM70_FP8_DEQUANT_FALLBACK": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_DEQUANT_FALLBACK", "1"))
+    ),
+    # Pascal (CC 6.x) FP8 block checkpoints: requantize to GGUF Q8_0 at load
+    # (weights stay 8-bit in VRAM) and run inference through the __dp4a()
+    # GGUF MMQ/MMVQ kernels (int8 x int8 -> int32 -> fp32). Default-on; set 0
+    # to restore the historical load-time dequant-to-fp16 fallback.
+    "VLLM_PASCAL_FP8_Q80": lambda: bool(
+        int(os.getenv("VLLM_PASCAL_FP8_Q80", "1"))
     ),
     # V100/SM70 block-FP8 dense path using TurboMind W8A16. Default-on matches
     # 0.0.3 for SM70 dense FP8; MoE route policy is controlled below.

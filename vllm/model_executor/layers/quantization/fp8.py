@@ -316,6 +316,8 @@ class Fp8Config(QuantizationConfig):
             else:
                 offline_method = Fp8LinearMethod(self)
                 offline_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
+                if _is_pascal_q80_enabled() and self.weight_block_size is not None:
+                    offline_method = Q80LinearMethod(self)
                 return offline_method
         elif isinstance(layer, RoutedExperts):
             if is_layer_skipped(
@@ -1732,3 +1734,10 @@ class Fp8KVCacheMethod(BaseKVCacheMethod):
 
     def __init__(self, quant_config: Fp8Config):
         super().__init__(quant_config)
+
+# Pascal Q8_0 GGUF-DP4A method (bottom import: breaks the
+# fp8<->q80 cycle; q80 imports Fp8LinearMethod/_w16a16_apply from here).
+from vllm.model_executor.layers.quantization.q80 import (  # noqa: E402
+    Q80LinearMethod,
+    _is_pascal_q80_enabled,
+)

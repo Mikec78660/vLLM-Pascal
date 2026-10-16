@@ -365,6 +365,12 @@ bundles **no** nvidia `.so` and its METADATA declares **no** nvidia deps —
     ldd $RT/venv/lib/python3.13/site-packages/torch/lib/libtorch_cuda.so \
       | grep -E 'libcublas.so.12|libcufft.so.11|libcurand.so.10|libcusparse.so.12|libnvJitLink.so.12'
 
+**Lean-LXC note:** the metapackage above pulls 331 packages (~7.9 GB of dev
+headers, docs, nsight, gcc plugins). On a single-purpose LXC with a small
+root FS that is pure bloat — the individual runtime packages are sufficient.
+Full no-bloat recipe (system pip, no venv) in **Step 2b**, verified on
+vLLM.lan 2026-09-11.
+
 No `nvcc` / `/usr/local/cuda` is needed at runtime: Triton 3.6.0 ships its
 own `ptxas` and the wheel is prebuilt.
 
@@ -437,6 +443,93 @@ llama.lan runtime has exactly the one cufile conf and nothing else.
         print(current_platform.get_attn_backend_cls(None, cfg, num_heads=24))
     "   # expect TRITON_ATTN on Pascal
 
+### Step 2b — deploy on a lean LXC (system pip, no venv, no bloat)
+
+Verified 2026-09-11 on vLLM.lan (Debian 13 LXC, 25 GB root FS, 5x P40 + 2x
+P4 passthrough). Use this instead of the venv flow when the target is a
+single-purpose LXC: **no virtualenv, system `pip --break-system-packages`,
+minimal apt footprint** (~1 GB of runtime libs, not 7.9 GB of dev metapackage).
+
+Prereqs: host GPU passthrough + driver libs in the container (`nvidia-smi`
+works), Python 3.13. That's it. No `/usr/local/cuda`, no `nvcc`.
+
+    # 1. the two local wheels from the build machine (Step 0/1), NOT from PyPI:
+    scp /opt/1Cat-vLLM/dist/1cat_vllm-1.3.1.dev0+cu124-cp313-cp313-linux_x86_64.whl \
+        /opt/torch-2.10.0-nccl.whl  root@<target>:/tmp/
+    ssh root@<target> '
+      # 2. runtime CUDA 12.4 libs — the individual packages, NOT
+      #    nvidia-cuda-toolkit (331 pkgs / 7.9 GB of dev junk).
+      #    Same libs the metapackage comment lists, plus libnccl2
+      #    (the source torch wheel bundles NO libnccl) and libcudart12:
+      apt-get install -y libcublas12 libcublaslt12 libcufft11 libcurand10 \
+        libcusparse12 libcusolver11 libcudart12 libcupti12 libnvjitlink12 \
+        libnccl2
+      # 3. install the vLLM wheel WITH deps (runtime_pascal set from PyPI):
+      pip3 install --break-system-packages --no-cache-dir \
+        /tmp/1cat_vllm-1.3.1.dev0+cu124-cp313-cp313-linux_x86_64.whl
+      # 4. the source torch wheel, --no-deps (a bare install lets the
+      #    resolver pull the PyPI cu128 torch build and clobbers the
+      #    hand-built Pascal wheel):
+      pip3 install --break-system-packages --no-deps --no-cache-dir \
+        /tmp/torch-2.10.0-nccl.whl
+      # 5. torchvision is REQUIRED (same reason as Step 2, item 4): the
+      #    registry inspects the arch in a subprocess that imports
+      #    image_processing_qwen2_vl -> torchvision.transforms at module
+      #    import. Missing it dies at boot with
+      #    "Model architectures [...] failed to be inspected" — a
+      #    confusing error; the wheel supports the arch fine.
+      #    (With system pip, step 3 already pulls torchvision==0.25.0 as a
+      #    dep — it imports fine next to the cu124 torch; do NOT uninstall.)
+    '
+
+**PITFALL (the one that fills the disk):** `pip install` of the vLLM wheel
+with deps pulls the PyPI `nvidia-*-cu12` packages (cublas, cudnn, cutlass,
+cusparselt, nccl, nvshmem, cuda-python, ...) — ~2 GB of libs that are NOT
+what torch uses at runtime (the source wheel's RUNPATH resolves the
+**system** apt libs). If root space is tight, after the wheel install run
+`pip3 uninstall -y --break-system-packages nvidia-cudnn-cu12
+nvidia-cudnn-frontend nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base
+nvidia-cusparselt-cu12 nvidia-nvshmem-cu12 nvidia-cublas-cu12
+nvidia-cuda-cccl-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvcc-cu12
+nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 nvidia-cufft-cu12
+nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12
+nvidia-nvjitlink-cu12 nvidia-nvtx-cu12 nvidia-nccl-cu12`
+— everything still works on the system apt libs. Keep `nvidia-cufile-cu12`
+(needed for the ld.so.conf entry below) and anything else `ldd
+.../torch/lib/libtorch_cuda.so | grep "not found"` says is missing (expect
+zero).
+
+**PITFALL (dpkg breakage):** if the container was ever given the NVIDIA
+`.run` driver installer, `/usr/bin/nvidia-installer` makes the apt
+`nvidia-installer-cleanup` postinst fail in noninteractive mode (exit 30),
+aborting every subsequent `apt-get install` with "Sub-process
+/usr/bin/dpkg returned an error code (1)". Fix: `rm -f
+/usr/bin/nvidia-installer /usr/bin/nvidia-uninstall` then
+`dpkg --configure -a`. The driver's `libcuda`/`nvidia-smi` are untouched —
+they come from the host kernel module + the userland driver package, not
+from the installer CLI.
+
+**PITFALL (stale GPU memory after a kill):** see Operational notes — kill
+by process group from the **host**; an orphaned `VLLM::EngineCore`
+reparents to systemd and keeps holding VRAM with no visible container
+process.
+
+Then the same single `ld.so.conf.d` entry as Step 2 (adjust the path for
+system site-packages):
+
+    printf '/usr/local/lib/python3.13/dist-packages/nvidia/cufile/lib\n' \
+        > /etc/ld.so.conf.d/1cat-vllm-cufile.conf
+    ldconfig
+
+Then the same `ldd ... libtorch_cuda.so | grep "not found"` check (expect
+zero) and the same smoke test as Step 2 (expect
+`TRITON_ATTN` / `TritonAttentionBackend`).
+
+Resulting footprint on a 25 GB root FS: OS ~1 GB, driver userland ~1.5 GB,
+apt cu12 runtime libs ~1 GB, torch wheel ~1.2 GB, vLLM wheel + pip deps
+~2.5 GB. Total ~8-11 GB. Model weights live on the data disk (`/mnt/AI`),
+never on root.
+
 
 ### Step 3 — serve (canonical launch)
 
@@ -483,6 +576,12 @@ Launchers for the tested configs live in `benchmarks/pascal/`
 - **Kill by process group, never by parent PID.** The `vllm serve` parent and the
   `VLLM::EngineCore`/worker tree are separate; killing only the parent orphans the
   engine (it keeps loading, holds all the VRAM, and its port never comes up).
+  **The orphan survives on the HOST**: in an LXC it reparents to the container's
+  `systemd` (host PID space), so `ps` inside the container shows nothing while
+  `nvidia-smi` still shows the VRAM held by a `[Not Found]` PID. Find it on the
+  host (`nvidia-smi --query-compute-apps=pid,process_name --format=csv`, then
+  `ps -p <pid> -o comm` on the host) and kill its **process group**:
+  `kill -TERM -$(ps -p <pid> -o pgid=)`.
 - **Stale `/dev/shm/psm_*`** from killed servers starve the next boot's broadcast
   pool — `rm -f /dev/shm/psm_*` only when the box is otherwise clean.
 - **Never benchmark two servers at once** on this box (shared CPU + PCIe/SHM).
