@@ -2083,7 +2083,22 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = PLE_SHARD_PREFIX
 
-        for name, loaded_weight in weights:
+        # weights may be a one-shot generator; materialize once so it can be
+        # logged and iterated. (Small: PLE weights only.)
+        _wl = list(weights)
+        if os.getenv("PLE_DEBUG_LOAD"):
+            _nm = [n for n, _ in _wl]
+            logger.info(
+                "PLE_DEBUG_LOAD NGramEmb.load_weights file_backed=%s got %d "
+                "names: %s",
+                file_backed, len(_nm), _nm,
+            )
+        # Also log what the child VocabParallelEmbedding would swallow.
+        for name, _w in _wl:
+            if os.getenv("PLE_DEBUG_LOAD") and name.startswith("ngram_embedding."):
+                logger.info("PLE_DEBUG_LOAD child-ngram prefix name: %r", name)
+
+        for name, loaded_weight in _wl:
             leaf_name = name.rsplit(".", 1)[-1]
             if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
                 continue
@@ -2161,52 +2176,78 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             regular_weights.append((name, loaded_weight))
 
         if file_backed:
-            missing_shards = [
-                index for index, shard in enumerate(self._disk_shards) if shard is None
-            ]
-            if missing_shards:
-                raise RuntimeError(
-                    f"PLE disk offload did not load shards: {missing_shards}"
+            # The AutoWeightsLoader may deliver this embedding's weights across
+            # SEVERAL load_weights calls: its shards live in the separate
+            # model-plefp8-* safetensors files, which sort after the main
+            # files, so the ple_embedding.* weights are non-contiguous in the
+            # stream and _groupby_prefix (itertools.groupby, consecutive-only)
+            # splits them into distinct calls. Accumulate shards across calls
+            # without raising here; build the mmap row-reader once every shard
+            # has arrived. (A use before completion is caught in
+            # _gather_mapped_rows.)
+            loaded_count = sum(1 for shard in self._disk_shards if shard is not None)
+            if loaded_count == self.split_ngram_parts:
+                self._ensure_disk_reader()
+            elif os.getenv("PLE_DEBUG_LOAD"):
+                logger.info(
+                    "PLE_DEBUG_LOAD file_backed load_weights call received %d "
+                    "shards so far (of %d); deferring reader build.",
+                    loaded_count, self.split_ngram_parts,
                 )
-            self._disk_shard_arrays = [
-                shard.view(torch.uint8).numpy()
-                for shard in self._disk_shards
-                if shard is not None
-            ]
-            self._disk_shard_pointers = [
-                array.ctypes.data for array in self._disk_shard_arrays
-            ]
-            self._disk_row_kernel, row_admission = prepare_mapped_row_gather(
-                pointers=self._disk_shard_pointers,
-                shard_size=self._disk_shard_size,
-                num_rows=self.ngram_embedding.org_vocab_size,
-                row_bytes=self.head_dim,
-                file_backed=bool(self._disk_mapped_paths),
-                enabled=self._disk_row_gather,
-                cache_bytes=getattr(self._kernel_config, "ple_row_cache_mib", 0) << 20,
-            )
-            if self._kernel_config is not None:
-                self._kernel_config.ple_disk_row_readers[self.layer_name] = (
-                    row_admission
-                )
-            logger.info("PLE mapped row-reader admission: %s", row_admission)
-            mapped_gib = (
-                sum(
-                    shard.numel() * shard.element_size()
-                    for shard in self._disk_shards
-                    if shard is not None
-                )
-                / 2**30
-            )
-            logger.info(
-                "Qwen4Exp PLE retained %.3f GiB across %d file-backed "
-                "safetensor mappings without an anonymous table copy.",
-                mapped_gib,
-                len(self._disk_mapped_paths),
-            )
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
         return loaded
+
+    def _ensure_disk_reader(self) -> None:
+        """Build the mmap row-reader once every shard has been loaded.
+
+        Idempotent: load_weights may be called once per contiguous weight
+        group, and the shards complete on a later call, so the reader is
+        built (exactly once) when the last shard arrives.
+        """
+        if self._disk_shard_pointers:
+            return
+        missing = [
+            index for index, shard in enumerate(self._disk_shards) if shard is None
+        ]
+        if missing:
+            raise RuntimeError(
+                f"PLE disk offload did not load shards: {missing}"
+            )
+        self._disk_shard_arrays = [
+            shard.view(torch.uint8).numpy() for shard in self._disk_shards
+        ]
+        self._disk_shard_pointers = [
+            array.ctypes.data for array in self._disk_shard_arrays
+        ]
+        self._disk_row_kernel, row_admission = prepare_mapped_row_gather(
+            pointers=self._disk_shard_pointers,
+            shard_size=self._disk_shard_size,
+            num_rows=self.ngram_embedding.org_vocab_size,
+            row_bytes=self.head_dim,
+            file_backed=bool(self._disk_mapped_paths),
+            enabled=self._disk_row_gather,
+            cache_bytes=getattr(self._kernel_config, "ple_row_cache_mib", 0) << 20,
+        )
+        if self._kernel_config is not None:
+            self._kernel_config.ple_disk_row_readers[self.layer_name] = (
+                row_admission
+            )
+        logger.info("PLE mapped row-reader admission: %s", row_admission)
+        mapped_gib = (
+            sum(
+                shard.numel() * shard.element_size()
+                for shard in self._disk_shards
+                if shard is not None
+            )
+            / 2**30
+        )
+        logger.info(
+            "Qwen4Exp PLE retained %.3f GiB across %d file-backed "
+            "safetensor mappings without an anonymous table copy.",
+            mapped_gib,
+            len(self._disk_mapped_paths),
+        )
 
 
 class Qwen4ExpPLELayer(nn.Module, MambaBase):
