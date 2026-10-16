@@ -133,6 +133,10 @@ class GGUFModelLoader(BaseModelLoader):
             # Gemma3 models use "gemma3_text" in HuggingFace but
             # "gemma3" in GGUF architecture naming
             model_type = "gemma3"
+        if model_type == "qwen3_5":
+            # Qwen3.5 (Qwen3.8) models use "qwen3_5" in HuggingFace but
+            # "qwen35" in GGUF architecture naming (gguf-py MODEL_ARCH_NAMES)
+            model_type = "qwen35"
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             # GGUF layer map assumes that we will have a merged expert weights
