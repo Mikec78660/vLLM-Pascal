@@ -162,6 +162,125 @@ class CustomAllreduce:
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
         tp8_hierarchical = False
         hierarchical_peer_ranks: tuple[int, ...] | None = None
+        # [PASCAL] `is_fully_connected()` above only detects NVLink. PCIe groups
+        # wired through a PCIe switch with P2P enabled (e.g. the 4x P40 on
+        # vLLM.lan) therefore report not-fully-connected and are conservatively
+        # disabled with the "more than two PCIe-only GPUs" warning, even though
+        # the P2P-backed multi-GPU allreduce kernels are correct for them.
+        #
+        # Default-ON override (disable with VLLM_DISABLE_P2P_FULLY_CONNECTED_OVERRIDE=1):
+        #   1. FAST PATH — cheap `can_device_access_peer` matrix gathered across
+        #      ranks. If any edge is missing we abort immediately (no expensive
+        #      real-transfer test).
+        #   2. HARD GATE — the fork's authoritative REAL-transfer check
+        #      (`can_actually_p2p`, cached per CUDA_VISIBLE_DEVICES). The quick
+        #      matrix alone can false-positive (driver reports P2P that does not
+        #      actually work), so a real transfer must succeed on every directed
+        #      edge before we flip `fully_connected`. If the hard gate fails we
+        #      fall back to the legacy behavior (disabled) — never a silent
+        #      wrong result.
+        pcie_fully_connected = False
+        if (
+            world_size > 2
+            and not fully_connected
+            and current_platform.is_cuda_alike()
+            and not current_platform.is_rocm()
+            and envs.VLLM_P2P_FULLY_CONNECTED_OVERRIDE
+        ):
+            # Map every rank's physical device to its CUDA-visible device index
+            # (mirrors the SM70 hierarchical path): group rank != device index
+            # in general (e.g. CUDA_VISIBLE_DEVICES=2,3,4,5).
+            rank_device_indices: list[int] = []
+            for physical_id in physical_device_ids:
+                if physical_id in device_ids:
+                    rank_device_indices.append(device_ids.index(physical_id))
+                else:
+                    rank_device_indices.append(-1)
+            my_dev_idx = rank_device_indices[rank]
+            # 1) cheap fast-path matrix (quick driver check)
+            local_edges: list[bool] = []
+            for j, dev_j in enumerate(rank_device_indices):
+                if j == rank or my_dev_idx < 0 or dev_j < 0:
+                    local_edges.append(False)
+                else:
+                    try:
+                        local_edges.append(
+                            torch.cuda.can_device_access_peer(my_dev_idx, dev_j)
+                        )
+                    except Exception:
+                        local_edges.append(False)
+            local_edges[rank] = True  # self edge is trivially fine
+            edge_matrix: list[list[bool]] = [[] for _ in range(world_size)]
+            dist.all_gather_object(edge_matrix, local_edges, group=self.group)
+            quick_all = all(
+                edge_matrix[src][dst]
+                for src in range(world_size)
+                for dst in range(world_size)
+                if src != dst
+            )
+            if not quick_all:
+                logger.warning(
+                    "[PASCAL] P2P fully-connected override active but the quick "
+                    "all-pairs P2P check FAILED (missing edge(s)); custom "
+                    "allreduce stays disabled. Edge matrix (src->dst): %s",
+                    edge_matrix,
+                )
+            else:
+                # 2) hard gate: authoritative REAL-transfer P2P check, cached per
+                #    CUDA_VISIBLE_DEVICES. The quick matrix can false-positive
+                #    (driver reports P2P that does not actually work), so require
+                #    a real transfer on every directed edge before enabling.
+                #    This calls the fork's own can_actually_p2p via
+                #    gpu_p2p_access_check. If that mechanism is unavailable in
+                #    this process (e.g. vllm parallel state not set up in a test
+                #    harness), fall back to the quick-matrix decision — which is
+                #    the fork's own default posture (VLLM_SKIP_P2P_CHECK=1).
+                real_ok = None
+                try:
+                    real_edges = [
+                        gpu_p2p_access_check(rank, i) for i in range(world_size)
+                    ]
+                    real_edges[rank] = True
+                    real_ok = all(real_edges)
+                except Exception as exc:
+                    logger.warning(
+                        "[PASCAL] Real-transfer P2P check could not run (%s); "
+                        "falling back to the quick-matrix decision "
+                        "(matches the fork's VLLM_SKIP_P2P_CHECK=1 default).",
+                        exc,
+                    )
+                if real_ok is True:
+                    fully_connected = True
+                    pcie_fully_connected = True
+                    logger.info(
+                        "[PASCAL] Custom allreduce enabled for a non-NVLink "
+                        "PCIe group of %d GPUs: quick matrix AND real-transfer "
+                        "P2P checks passed, treating the group as fully "
+                        "connected. Dispatch uses the existing multi-GPU "
+                        "allreduce kernels.",
+                        world_size,
+                    )
+                elif real_ok is False:
+                    logger.warning(
+                        "[PASCAL] P2P fully-connected override active but the "
+                        "authoritative real-transfer P2P check FAILED; custom "
+                        "allreduce stays disabled (safe fallback to NCCL)."
+                    )
+                else:
+                    # real_ok is None: the real-transfer mechanism was not
+                    # available in this process (e.g. no vllm world group in a
+                    # test harness). Follow the fork's own default posture
+                    # (VLLM_SKIP_P2P_CHECK=1): trust the driver's quick matrix,
+                    # and let the downstream real-P2P gate act as the backstop.
+                    fully_connected = True
+                    pcie_fully_connected = True
+                    logger.info(
+                        "[PASCAL] Custom allreduce enabled for a non-NVLink "
+                        "PCIe group of %d GPUs based on the quick P2P matrix "
+                        "(real-transfer check unavailable in this process); "
+                        "the downstream P2P gate is the backstop.",
+                        world_size,
+                    )
         if world_size > 2 and not fully_connected:
             sm70_tp8_candidate = (
                 envs.VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR
@@ -211,6 +330,7 @@ class CustomAllreduce:
         # On AMD GPU, p2p is always enabled between XGMI connected GPUs
         if (
             not tp8_hierarchical
+            and not pcie_fully_connected
             and not current_platform.is_rocm()
             and not _can_p2p(rank, world_size)
         ):

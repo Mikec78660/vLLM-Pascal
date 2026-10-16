@@ -219,6 +219,11 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH: bool = True
     VLLM_SM70_MOE_ADD_ALLREDUCE: bool = False
     VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR: bool = False
+    # [PASCAL] Default-on: treat a non-NVLink (PCIe) group that passes a
+    # complete all-pairs P2P check as fully connected so the multi-GPU custom
+    # allreduce kernels dispatch (e.g. 4x P40 behind a PCIe switch).
+    VLLM_P2P_FULLY_CONNECTED_OVERRIDE: bool = True
+    VLLM_DISABLE_P2P_FULLY_CONNECTED_OVERRIDE: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH: bool = True
@@ -1941,6 +1946,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR": lambda: bool(
         int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR", "0"))
     ),
+    # [PASCAL] Default-on: treat a non-NVLink (PCIe) group that passes a
+    # complete all-pairs P2P check as fully connected so the multi-GPU custom
+    # allreduce kernels dispatch (e.g. 4x P40 behind a PCIe switch).
+    "VLLM_P2P_FULLY_CONNECTED_OVERRIDE": lambda: bool(
+        int(os.getenv("VLLM_P2P_FULLY_CONNECTED_OVERRIDE", "1"))
+    )
+    and not bool(int(os.getenv("VLLM_DISABLE_P2P_FULLY_CONNECTED_OVERRIDE", "0"))),
     # Legacy 0.0.3 SM70 MoE permute/unpermute micro fast paths. They bypass
     # CUB sort and the generic k-way reduction for the n_token==1 decode case.
     # The unpermute-only subpath has strict Type-A regression coverage and is
