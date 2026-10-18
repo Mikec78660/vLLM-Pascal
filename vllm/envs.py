@@ -423,6 +423,10 @@ if TYPE_CHECKING:
     VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS: int = 0
     VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION: str | None = None
     VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION: str | None = None
+    # Pascal register-pressure overrides for kernel_unified_attention (NOT
+    # gated on is_device_capability(70), which is False on cc6.1). 0 = off.
+    VLLM_ATTN_FORCE_NUM_STAGES: int = 0
+    VLLM_ATTN_FORCE_NUM_WARPS: int = 0
     VLLM_SM70_GDN_KKT_SCHEDULE: bool = True
     VLLM_SM70_GDN_KKT_BK: str | None = None
     VLLM_SM70_GDN_KKT_WARPS: str | None = None
@@ -2601,6 +2605,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION": lambda: os.getenv(
         "VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION"
+    ),
+    "VLLM_ATTN_FORCE_NUM_STAGES": lambda: int(
+        os.getenv("VLLM_ATTN_FORCE_NUM_STAGES", "0")
+    ),
+    "VLLM_ATTN_FORCE_NUM_WARPS": lambda: int(
+        os.getenv("VLLM_ATTN_FORCE_NUM_WARPS", "0")
     ),
     # Experimental SM70 GDN/FLA KKT autotune search-space gate.
     "VLLM_SM70_GDN_KKT_SCHEDULE": lambda: bool(

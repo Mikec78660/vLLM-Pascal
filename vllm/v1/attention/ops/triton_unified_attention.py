@@ -1082,6 +1082,40 @@ def unified_attention(
     )
     if sm70_launch_num_warps:
         launch_kwargs["num_warps"] = sm70_launch_num_warps
+    # Pascal (cc6.x) register-pressure override.
+    #
+    # kernel_unified_attention compiles at the Pascal 255-register cap with
+    # heavy local-memory spilling (num_stages=3 default pipelining of the KV
+    # tiles + Q + acc + M/L + addresses > 255 regs/thread at head_size 256,
+    # BLOCK_M 16, num_warps 4). The spilling + the tiny decode grid (1 kv head
+    # per GPU on TP4) makes long-context decode ~100x slower than short.
+    #
+    # VLLM_ATTN_FORCE_NUM_STAGES: override Triton's num_stages (pipeline
+    # depth). 0 = upstream default (3). 1 disables the KV pipeline -> ~32
+    # fewer regs/thread -> no spill. Applies to BOTH the 2D (MTP-verify /
+    # prefill) and 3D (pure decode) paths, because the MTP-verify path
+    # (max_seqlen_q>1) is the one that collapses and it is NOT covered by the
+    # max_seqlen_q<=1 "decode" gate.
+    #
+    # VLLM_ATTN_FORCE_NUM_WARPS: override num_warps for all paths (0 = the
+    # sm70/auto value). 8 halves regs/thread as a secondary lever if
+    # num_stages alone is insufficient.
+    _force_num_stages = envs.VLLM_ATTN_FORCE_NUM_STAGES
+    if _force_num_stages > 0:
+        launch_kwargs["num_stages"] = _force_num_stages
+        logger.info_once(
+            "Attention num_stages forced to %d (register-pressure override; "
+            "VLLM_ATTN_FORCE_NUM_STAGES)",
+            _force_num_stages,
+        )
+    _force_num_warps = envs.VLLM_ATTN_FORCE_NUM_WARPS
+    if _force_num_warps > 0:
+        launch_kwargs["num_warps"] = _force_num_warps
+        logger.info_once(
+            "Attention num_warps forced to %d (register-pressure override; "
+            "VLLM_ATTN_FORCE_NUM_WARPS)",
+            _force_num_warps,
+        )
 
     kernel_unified_attention[grid](
         output_ptr=out,
