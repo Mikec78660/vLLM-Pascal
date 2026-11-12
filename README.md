@@ -21,6 +21,8 @@ All Qwen3.5/3.8 checkpoints tested here are hybrid GDN linear-attention models
 
 | Patch | What it does | Why |
 |---|---|---|
+| `[PASCAL]` Q8_0 lm_head decode route (`vocab_parallel_embedding.py`, env `VLLM_PASCAL_Q8_LM_HEAD=1` + `VLLM_PASCAL_FP32_LM_HEAD=1`) | Packs the lm_head weight shard to GGUF Q8_0 at first apply (62,080 rows → 337.7 MB/rank at TP4) and routes decode/verify logits through the fork's DP4A kernels: `ggml_mul_mat_vec_a8` at M=1, `ggml_mul_mat_a8` (MMQ) at M>1. Greedy output token-identical to the fp32 path | The 27B vocab (152k, 62k rows/rank at TP4) lm_head is the biggest single decode kernel on Pascal — fp16 cuBLAS re-streams fp16 weights every step. Q8_0 halves the bytes and DP4A sidesteps the missing int8 tensor cores: **35.5 → 25.1 ms/token** (−29%) on 4×P40 |
+| `[PASCAL]` FP32 lm_head cast (`vocab_parallel_embedding.py`, env `VLLM_PASCAL_FP32_LM_HEAD=1`) | Casts the lm_head shard to fp32 at load; fp32 `F.linear` at decode, logits cast back to fp16 | Pure cuBLAS kernel-selection win: fp16 `M=1` GEMM picks a bad tile on sm_61, fp32 picks `gemv2T` → **48.4 → 35.5 ms/token** on the Qwen3.8-FP8 checkpoint. Also the prerequisite for the Q8 route above |
 | `[PASCAL]` fast CUDA GEMV now fires for symmetric CT int4 (`triton_w4a16.py`): synthesizes the packed constant-zero tensor so the split-K CUDA GEMV runs | Symmetric CT int4 (RedHatAI `*-INT4`) has no zero-point tensor; the GEMV gate required one, so decode fell to the slow Triton tl.dot GEMM. Now `apply_weights` builds the constant-zero tensor (8 packed nibbles = `0x88888888`, uint4b8 bias=8, reinterpreted as signed int32 so `torch.full` doesn't overflow — the kernel reads a signed int and masks `&0xF`, so sign-extension never corrupts the nibble). Identical dequant to the Triton `ZP_BIAS` path, output unchanged, decode ~2x faster | RedHatAI/Qwen3.8-27B-INT4 decode ~3.0 t/s; this is the actual fix (the Exllama-vs-TritonW4A16 kernel-class swap alone changed nothing) || `[PASCAL]` WNA16 int4 kernel priority (CC<70): prefer TritonW4A16 over Exllama by default  | On CUDA Pascal (P100=6.0/P40=6.1) with `--linear-backend auto`, `choose_mp_linear_kernel` reorders `TritonW4A16LinearKernel` ahead of `ExllamaLinearKernel`. No-op on SM70+, on ROCm, or when an explicit `--linear-backend` is set.  | Marlin int4 needs SM70, so on Pascal only Exllama+TritonW4A16 can run, and Exllama is listed first. actorder:static CT checkpoints (e.g. RedHatAI `*INT4`, g128) pass Exllama's `can_implement`, so auto picked Exllama - a GEMV ~2x SLOWER on CC6.x than TritonW4A16 (swap from AWQ-INT4 halved decode). actorder:group (AWQ) already fell through to TritonW4A16 because Exllama rejects g_idx. The reorder makes the fast kernel the default so a model swap can no longer silently regress decode speed. Launch scripts still pass `--linear-backend triton` as belt-and-suspenders. See `references/w4a16-kernel-dispatch-pascal.md`. |
 | `kv_cache_dtype fp8 → int8_per_token_head` alias  | On CC < 70, `--kv-cache-dtype fp8` is remapped to `int8_per_token_head` | Triton on SM6.x cannot compile `fp8e4nv`; the int8 per-token-head path uses the same 1 byte/token, has better precision (7-bit mantissa), and is fully supported by the TRITON_ATTN backend. Your harness keeps passing `fp8`; the fork quietly does the right thing. |
 | CT W8A8-FP8 load-time dequant fallback  | `compressed-tensors` per-channel FP8 (e.g. RedHatAI `*-FP8-dynamic`) dequants to FP16 at load on CC < 70; decode runs cuBLAS FP16 | Upstream scheme hard-gates `min_capability 89` (cutlass scaled_mm, SM89 kernels). Pascal: materialize weights once, never touch FP8 at runtime. |
@@ -41,8 +43,27 @@ carries them as hand-tuned files, not that commit history.
 
 ## Test system
 
-All numbers below come from one physical machine (`llama.lan`), a Debian 13 (trixie)
-LXC container on a Proxmox host:
+### Current primary: `pve-g.lan` → LXC CT 101 `vllm-dev` (all 2026-11 numbers)
+
+| | |
+|---|---|
+| Host | Proxmox, **AMD EPYC 7352** (24c/48t), 251 GiB RAM |
+| Container | LXC CT 101 `vllm-dev`, Debian 13, **32 vCPU / 64 GiB**, 73 GiB root FS |
+| GPUs | **2× Tesla P4** (8 GB, CC 6.1, idx 0–1) + **6× Tesla P40** (24 GB GDDR5 ~250 GB/s theoretical / ~196 GB/s effective, CC 6.1, idx 2–7), all passed through |
+| PCIe | All links negotiate **Gen1 (2.5 GT/s)**; GPU 41:00.0 at x16, others x8 (downgraded). TP collectives run via NCCL SHM/P2P, so decode stays GPU-bandwidth-bound — a PIX-only group (GPUs 4–7) measured **neutral** vs 2–5 (25.16 vs 25.12 ms/tok) |
+| Driver | **580.159.04** — CT userspace MUST match the host kernel module or NVML dies with `Driver/library version mismatch` |
+| Runtime | Python 3.13, uv venv `/opt/vllm-build-env` (no pip inside — use `/usr/local/bin/uv pip --python ...`), **torch 2.13.0a0+git cu129 Pascal build** (`sm_60/sm_61`), vLLM 1.3.1.dev0 |
+| Deps gotchas | `torchvision==0.28.0+cu129` (cu129 index; torch 2.13 pairs with 0.28); **no torchaudio** (no cu129 build — import check kills boot); conda-forge libstdc++ 15 (`libstdc++.so.6.0.34`) in `/opt/vllm-build-env/lib` + `ld.so.conf.d` entry (system GLIBCXX is too old for the wheels) |
+| Models | ZFS volume mounted read-only at `/mnt/AI2` (`pct set 101 -mp1 data:subvol-100-disk-1,mp=/mnt/AI2,ro=1`) |
+| Env | `CUDA_DEVICE_ORDER=PCI_BUS_ID` REQUIRED (default order ≠ PCI order on this LXC); `TRITON_CACHE_DIR=/root/.triton-cache` (fresh TP shape = 5–15 min cold JIT, steady-state numbers hold either way) |
+
+Mixed P4/P40 fleet: P4 TP=2 cannot hold 27B-FP8 (14.2 GiB/rank needed, 8 GB card)
+— it only runs the 9B int4 (7.8 GiB/rank); P4→P40 in one TP group is net-negative
+(slowest card sets the step rate). **P40 groups only: TP=2 idx 2,3 / TP=4 idx 2,3,4,5.**
+
+### Legacy: `llama.lan` (source of the 2026-09 numbers further below)
+
+Debian 13 (trixie) LXC on a Proxmox host:
 
 | | |
 |---|---|
@@ -93,7 +114,74 @@ decode token through Python and burns 4 CPU cores; with graphs worker CPU is ~0%
 
 ## Results
 
-### Qwen3.5-9B-FP8-dynamic (→ FP16 materialized) — the P40 x2 / x4 matrix
+### Qwen3.8-27B-FP8 — current matrix (pve-g CT 101, 2026-11-12, this fork)
+
+Checkpoint `/mnt/AI2/FP8` (`Qwen3_5ForConditionalGeneration`, blockwise FP8,
+native MTP head). Server flags: `--dtype float16 --quantization fp8
+--max-model-len 16384 --max-num-seqs 4 --gpu-memory-utilization 0.92
+--compilation-config '{"mode":0,"cudagraph_mode":"FULL"}'` (GDN downgrades to
+FULL_DECODE_ONLY) `--speculative-config '{"method":"mtp",
+ num_speculative_tokens":2,"enforce_eager":true,"use_local_argmax_reduction":true}'`
++ `VLLM_PASCAL_FP32_LM_HEAD=1 VLLM_PASCAL_Q8_LM_HEAD=1`. One server at a time,
+warm Triton cache, 1 unmeasured warmup request, then N concurrent streams of
+250 tokens (temp 0, `ignore_eos`, `enable_thinking:false`), tokens from `usage`.
+
+| TP (P40 idx) | sessions | aggregate t/s | per session | TTFT (s) | KV pool |
+|---|---|---|---|---|---|
+| **2** (2,3) | 1 | 23.47 | 23.47 | 0.54 | 33,314 tok (2.03× @ 16k) |
+| 2 | 2 | 25.16 | 12.58 | 0.5–3.7 | " |
+| 2 | 4 | 39.79 | 9.95 | 2.1 | " |
+| **4** (2,3,4,5) | 1 | **37.61** | **37.61** | 0.30 | 495,889 tok (30.3× @ 16k) |
+| 4 | 2 | 45.79 | 22.89 | 0.3–1.7 | " |
+| 4 | 4 | **64.93** | 16.23 | 0.3–1.2 | " |
+
+TP=2 puts 17.77 GiB of FP16-materialized weights on each card — only ~1.6 GiB
+survives for KV, hence the 33k-token pool; TP=4 halves per-card weights (8.58
+GiB) and the KV pool grows **15×**. TP=4 is the production shape; TP=2 is a
+capacity-limited fallback (2 concurrent 16k sessions at best).
+
+Decode-speed ladder, single stream, 4×P40 (offline engine, 64/256-token steady
+state, same engine flags):
+
+| config | ms/token | t/s |
+|---|---|---|
+| stock (fp16 lm_head, cuBLAS) | 48.4 | 20.7 |
+| + `VLLM_PASCAL_FP32_LM_HEAD` | 35.5 | 28.2 |
+| + `VLLM_PASCAL_Q8_LM_HEAD` (**this fork**) | **25.07** | **39.9** |
+
+(256-token run reproduces 25.07 exactly — genuine steady state; the server
+matrix above reads 37.6 t/s single-stream because of ~0.3 s scheduling + SSE
+overhead per request. The older llama.lan 8.70 t/s number was pre-patch on a
+Gen1 x1 PCIe box and without the lm_head routes.)
+
+Kernel census at 25 ms/tok (node-level nsys, 4 ranks): graphed Q8 FFN ~10.9 +
+graph elementwise ~4.1 + graph allreduce ~2.1 + eager MTP draft ~6.6 + GDN
+recurrent ~0.8 — GPU ~95% busy; the remaining floor is P40 GDDR5 bandwidth on
+the FFN passes, not host or launch overhead.
+
+### Qwen3.8-27B-FP8 (legacy, llama.lan TP=4 P40s 2026-09, +MTP k=2, graphs)
+
+| conc | decode t/s (agg) | per stream |
+|---|---|---|
+| x1 | 8.70 | 8.70 |
+| x2 | 12.51 | 6.3 |
+| x4 | 19.04 | 4.8 |
+
+(warm cache; earlier same-flags runs: x1 7.41–7.57, x4 ~16.4–17.6 — the spread
+is the MTP acceptance variance between boots, not a config difference)
+
+Aggregate saturates ~16–19 t/s; the 3rd session is near-free, the 4th adds
+little; more sessions queue. FP8 on Pascal buys **footprint, not speed**: the
+dequant fallback leaves FP16 weights (2 bytes/weight) so the decode ceiling is the
+weight-streaming floor (~12 t/s best-case single). KV pool: 336,855 tokens @
+util 0.92 (10.3× @ 32k; earlier boots: 290k @ 0.85, 422k @ 0.92). MTP k=2
+acceptance ~80% (position 1 ~0.82) — a real but modest win on this checkpoint;
+`max_num_scheduled_tokens` auto-sets to 2048.
+
+*(superseded by the pve-g matrix above: the lm_head routes + FULL-graph decode
+took single-stream from 8.7 to 37.6 t/s)*
+
+### Qwen3.5-9B-FP8-dynamic (→ FP16 materialized) — the P40 x2 / x4 matrix (legacy llama.lan)
 
 P40s 0,1 (TP=2), ctx 32768, KV fp16, graphs — full sweep, warm cache:
 
@@ -173,25 +261,6 @@ vLLM meets llama.cpp on the same hardware. The prefill block-cliff fix
 `TritonW4A16LinearKernel` at 11.23 x1; that wheel is not in this branch —
 see the dead-ends note below for what that gap actually was.)
 
-### Qwen3.8-27B-FP8 (TP=4 P40s, +MTP k=2, graphs)
-
-| conc | decode t/s (agg) | per stream |
-|---|---|---|
-| x1 | 8.70 | 8.70 |
-| x2 | 12.51 | 6.3 |
-| x4 | 19.04 | 4.8 |
-
-(warm cache; earlier same-flags runs: x1 7.41–7.57, x4 ~16.4–17.6 — the spread
-is the MTP acceptance variance between boots, not a config difference)
-
-Aggregate saturates ~16–19 t/s; the 3rd session is near-free, the 4th adds
-little; more sessions queue. FP8 on Pascal buys **footprint, not speed**: the
-dequant fallback leaves FP16 weights (2 bytes/weight) so the decode ceiling is the
-weight-streaming floor (~12 t/s best-case single). KV pool: 336,855 tokens @
-util 0.92 (10.3× @ 32k; earlier boots: 290k @ 0.85, 422k @ 0.92). MTP k=2
-acceptance ~80% (position 1 ~0.82) — a real but modest win on this checkpoint;
-`max_num_scheduled_tokens` auto-sets to 2048.
-
 ### Qwen3.8-27B-INT8-W8A16 (TP=4 P40s, ctx 32768)
 
 | config | x1 | x2 | x4 | x8 |
@@ -232,6 +301,21 @@ Verified identical pool between `--kv-cache-dtype fp8` and
 
 ## Dead ends (do not retry; full write-ups in the skill)
 
+- **(2026-11, Qwen3.8-FP8 on pve-g CT 101) Drafter CUDA graphs.** `enforce_eager:false`
+  for the MTP proposer is a **no-op**: effective mode FULL_DECODE_ONLY has
+  `mixed_mode()==NONE`, so the drafter's PIECEWISE keys are never armed. Force-arming
+  them (env `VLLM_PASCAL_DRAFT_GRAPH=1`, in-tree) **regresses** 25.1 → 26.2 ms/tok.
+  Run the drafter eager.
+- **(2026-11) `cudagraph_mode:"FULL_AND_PIECEWISE"`**: 45.3 ms/tok — the GDN
+  downgrade path strips the target's FULL decode graphs. Keep `"FULL"`.
+- **(2026-11) Q8 vec-kernel routing for small-M verify (`VLLM_PASCAL_Q80_VEC_SMALL_M=1`):**
+  48.7 ms/tok — `ggml_mul_mat_vec_a8` re-reads the full weight block per draft vector
+  at M=2..4 (M× traffic). MMQ tiled stays for M>1. (M=1 correctly uses the vec kernel.)
+- **(2026-11) MTP k=1 / k=3:** 37.0 / 33.5 vs 25.1 ms/tok at k=2. **Prefix caching:**
+  no gain (hybrid-GDN 'align' mamba cache re-prefills anyway). **PIX-only GPU group**
+  (idx 4–7 vs 2–5): neutral (25.16 vs 25.12) — decode is bandwidth-bound, not
+  collective-bound. **Tied-head Q8 for the draft lm_head:** the draft's tied
+  `embed_tokens` uses a different quant path; the patched `apply` route never fires.
 - `--dtype float32`: OOM at profile on P100s (144 MiB alloc on 15.9 GiB); on P40s
   it boots then dies on first request — `ChunkGatedDeltaRuleFunction does not
   support float32`. **fp16 is the only working dtype on CC 6.x.**
@@ -561,6 +645,35 @@ $RT/venv/bin/vllm serve /AI/models/Qwen3.8-27B-INT8-W8A16-MTP \
 # also accept `fp8` as an alias for int8_per_token_head, but the older dev2
 # build does NOT have that alias — pass int8_per_token_head explicitly so this
 # block works on any build of the fork. Do NOT pass --enforce-eager.
+```
+
+Canonical launch for **Qwen3.8-27B-FP8 on pve-g CT 101** (measured 37.6 t/s
+single-stream, 64.9 t/s @ 4 sessions — 2026-11-12):
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=2,3,4,5 \
+LD_LIBRARY_PATH=/opt/vllm-build-env/lib \
+TRITON_CACHE_DIR=/root/.triton-cache \
+VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 \
+VLLM_PASCAL_FP32_LM_HEAD=1 \
+VLLM_PASCAL_Q8_LM_HEAD=1 \
+/opt/vllm-build-env/bin/vllm serve /mnt/AI2/FP8 \
+  --tensor-parallel-size 4 \
+  --dtype float16 --quantization fp8 \
+  --max-model-len 16384 --max-num-seqs 4 \
+  --gpu-memory-utilization 0.92 \
+  --compilation-config '{"mode":0,"cudagraph_mode":"FULL"}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":2,"enforce_eager":true,"use_local_argmax_reduction":true}' \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --reasoning-parser qwen3 \
+  --host 0.0.0.0 --port 8000
+# The Qwen3.8 chat template INJECTS reasoning instructions when
+# `enable_thinking` is undefined -> the switch above is REQUIRED for clean
+# non-thinking output on /v1/chat/completions (a client can re-enable it per
+# request via chat_template_kwargs). /v1/completions applies no template.
+# First request per boot runs ~+1 s while the Q8_0 lm_head packs lazily
+# (337 MB/rank); log line: "Pascal Q8 lm_head packed: rows=62080".
 ```
 
 Launchers for the tested configs live in `benchmarks/pascal/`
