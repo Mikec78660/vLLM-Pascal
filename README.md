@@ -154,6 +154,28 @@ matrix above reads 37.6 t/s single-stream because of ~0.3 s scheduling + SSE
 overhead per request. The older llama.lan 8.70 t/s number was pre-patch on a
 Gen1 x1 PCIe box and without the lm_head routes.)
 
+**Prefill throughput, single request** (same servers/flags, 2026-11-12;
+`max_tokens=1`, best of 2 after one unmeasured warmup per length, warm Triton
+cache; prompt = repeated-sentence block cut to the token count reported by
+`usage`. Cross-checked with streamed first-chunk TTFT on a fresh TP4 server —
+5728 tok → 43.8 s, identical to wall; the engine's own "Avg prompt throughput"
+log over-reports because it credits the whole prompt to the completion window):
+
+| prompt tok | TP=2 TTFT (s) | TP=2 t/s | TP=4 TTFT (s) | TP=4 t/s |
+|---|---|---|---|---|
+| 875   | 12.05  | 72.6 | 6.10  | 143.5 |
+| 1,728 | 24.45  | 70.7 | 12.48 | 138.5 |
+| 3,435 | 54.92  | 62.5 | 26.79 | 128.2 |
+| 6,848 | 117.63 | 58.2 | 57.54 | 119.0 |
+
+Prefill runs **eager** (GDN downgrades CUDA graphs to decode-only) on the
+Triton/FLA chunked-GDN kernel; the drop with length is the full-attention
+layers' quadratic term. TP=4 nearly doubles the prefill rate over TP=2 —
+allreduce is a small share of compute-bound prefill, unlike decode where it
+and weight bandwidth dominate. On Gen1 PCIe links a 4k prompt still costs
+~27 s of TTFT, which is the practical argument for the MTP/decode-side focus
+of this fork rather than long-prompt serving on Pascal.
+
 Kernel census at 25 ms/tok (node-level nsys, 4 ranks): graphed Q8 FFN ~10.9 +
 graph elementwise ~4.1 + graph allreduce ~2.1 + eager MTP draft ~6.6 + GDN
 recurrent ~0.8 — GPU ~95% busy; the remaining floor is P40 GDDR5 bandwidth on
